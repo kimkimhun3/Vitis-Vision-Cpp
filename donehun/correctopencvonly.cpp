@@ -82,42 +82,6 @@ static gboolean set_resolution_from_input(const char* input_res) {
     }
 }
 
-struct InterleaveUV_Parallel {
-  // Pointers to the start of the output NV12 UV plane, and input U/V planes
-  uchar *nv12_uv_plane_ptr;
-  const uchar *u_plane_ptr;
-  const uchar *v_plane_ptr;
-
-  // Dimensions for calculating offsets
-  int uv_plane_width_pixels; // Width of U/V plane in pixels (width / 2)
-  size_t u_v_plane_stride;   // Stride of U/V planes in bytes (width / 2)
-
-  // Constructor to initialize member variables
-  InterleaveUV_Parallel(uchar *nv12_uv, const uchar *u_data,
-                        const uchar *v_data, int uv_width, size_t u_v_stride)
-      : nv12_uv_plane_ptr(nv12_uv), u_plane_ptr(u_data), v_plane_ptr(v_data),
-        uv_plane_width_pixels(uv_width), u_v_plane_stride(u_v_stride) {}
-
-  // The operator() that will be called by parallel_for_ for each range of rows
-  void operator()(const cv::Range &range) const {
-    // Iterate over the rows assigned to this thread
-    for (int row = range.start; row < range.end; ++row) {
-      // Calculate starting pointers for the current row in each plane
-      const uchar *u_row_ptr = u_plane_ptr + (row * u_v_plane_stride);
-      const uchar *v_row_ptr = v_plane_ptr + (row * u_v_plane_stride);
-      // NV12 UV plane has 2 bytes per U/V pixel (U then V)
-      uchar *nv12_uv_row_ptr =
-          nv12_uv_plane_ptr + (row * uv_plane_width_pixels * 2);
-
-      // Interleave U and V components for the current row
-      for (int col = 0; col < uv_plane_width_pixels; ++col) {
-        nv12_uv_row_ptr[2 * col] = u_row_ptr[col];     // U component
-        nv12_uv_row_ptr[2 * col + 1] = v_row_ptr[col]; // V component
-      }
-    }
-  }
-};
-
 // Callback to extract video info when caps are negotiated
 static void on_pad_added(GstElement *element, GstPad *pad, gpointer user_data) {
     CustomData *data = (CustomData *)user_data;
