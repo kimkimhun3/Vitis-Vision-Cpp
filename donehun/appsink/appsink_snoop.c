@@ -116,7 +116,7 @@ on_source_message (GstBus * bus, GstMessage * message, ProgramData * data)
   return TRUE;
 }
  
-/* called when we get a GstMessage from the sink pipeline when we get EOS, we
+/* called when we get a GstMessage from the sink pipeline when we get EOS, wes
  * exit the mainloop and this testapp. */
 static gboolean
 on_sink_message (GstBus * bus, GstMessage * message, ProgramData * data)
