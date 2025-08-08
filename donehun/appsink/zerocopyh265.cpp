@@ -13,36 +13,6 @@ typedef struct {
     GstVideoInfo video_info;
 } CustomData;
 
-// Direct buffer passthrough from appsink to appsrc
-// GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
-//     CustomData *data = (CustomData *)user_data;
-//     GstSample *sample = gst_app_sink_pull_sample(appsink);
-//     if (!sample) return GST_FLOW_ERROR;
-
-//     GstBuffer *buffer = gst_sample_get_buffer(sample);
-//     if (!buffer) {
-//         gst_sample_unref(sample);
-//         return GST_FLOW_ERROR;
-//     }
-
-//     if (!data->video_info_valid) {
-//         GstCaps *caps = gst_sample_get_caps(sample);
-//         if (caps && gst_video_info_from_caps(&data->video_info, caps)) {
-//             data->video_info_valid = TRUE;
-//         } else {
-//             gst_sample_unref(sample);
-//             return GST_FLOW_ERROR;
-//         }
-//     }
-
-//     GstBuffer *out_buffer = gst_buffer_copy(buffer);
-//     gst_buffer_copy_into(out_buffer, buffer, GST_BUFFER_COPY_TIMESTAMPS, 0, -1);
-
-//     GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(data->appsrc), out_buffer);
-//     gst_sample_unref(sample);
-//     return ret;
-// }
-
 GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
     CustomData *data = (CustomData *)user_data;
     GstSample *sample = gst_app_sink_pull_sample(appsink);
@@ -63,17 +33,9 @@ GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
             return GST_FLOW_ERROR;
         }
     }
-
-    // 🚫 REMOVE buffer copy
-    // ✅ REF buffer to take ownership without copying
     gst_buffer_ref(buffer);
-
-    // Push the original buffer to appsrc
     GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(data->appsrc), buffer);
-
-    // Free the sample (but NOT the buffer — it’s ref'd)
     gst_sample_unref(sample);
-
     return ret;
 }
 
