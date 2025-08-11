@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     guint      width   = RES_4K_W;   // default 4K
     guint      height  = RES_4K_H;
     guint      fps     = 60;
-    guint      bitrate_kbps = 30000; // kbps (do NOT multiply by 1000)
+    guint      bitrate_kbps = 10000; // kbps (do NOT multiply by 1000)
     std::string codec  = "h264";     // "h264" or "h265"
 
     // Only 2K and 4K presets per your spec
