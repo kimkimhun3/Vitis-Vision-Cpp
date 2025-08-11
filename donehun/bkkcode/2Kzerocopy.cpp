@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
     // Ingest pipeline: camera → appsink (keep 4K60 as you had it)
     const gchar *sink_pipeline_str =
         "v4l2src device=/dev/video0 io-mode=4 ! "
-        "video/x-raw, format=NV12, width=3840, height=2160, framerate=60/1 ! "
+        "video/x-raw, format=NV12, width=1920, height=1080, framerate=60/1 ! "
         "appsink name=my_sink emit-signals=true max-buffers=1 drop=true sync=false";
 
     GstElement *sink_pipeline = gst_parse_launch(sink_pipeline_str, &error);
