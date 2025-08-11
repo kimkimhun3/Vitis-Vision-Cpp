@@ -39,4 +39,4 @@ The pipeline is optimized for:
 
 ## Pipeline Diagram
 
-![FPGA NV12 Pipeline](file:///Users/hoon/Downloads/pipeline.svg)
+![FPGA NV12 Pipeline](pipeline.svg)
