@@ -35,3 +35,8 @@ The pipeline is optimized for:
    +------------------+     +----------------------+     +--------------------+
    | GStreamer (appsrc)| --> | Encoder (H.264/H.265)| --> | Network Stream (RTP/UDP) |
    +------------------+     +----------------------+     +--------------------+
+
+
+## Pipeline Diagram
+
+![FPGA NV12 Pipeline](/Vitis-Vision-Cpp/pipeline.svg)
