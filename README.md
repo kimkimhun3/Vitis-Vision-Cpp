@@ -35,7 +35,7 @@ The pipeline is optimized for:
    +------------------+     +----------------------+     +--------------------+
    | GStreamer (appsrc)| --> | Encoder (H.264/H.265)| --> | Network Stream (RTP/UDP) |
    +------------------+     +----------------------+     +--------------------+
-
+```
 
 ## Pipeline Diagram
 
