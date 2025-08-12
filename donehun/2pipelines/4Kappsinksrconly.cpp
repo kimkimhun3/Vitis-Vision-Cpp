@@ -150,3 +150,12 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
+
+gst-launch-1.0 \
+v4l2src device=/dev/video0 io-mode=4 do-timestamp=false ! \
+video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! \
+videorate drop-only=true max-rate=60 ! \
+omxh265enc skip-frame=1 max-consecutive-skip=4 max-picture-size=2073600 gop-mode=low-delay target-bitrate=20000000 num-slices=4 control-rate=variable qp-mode=auto prefetch-buffer=true cpb-size=20000000 initial-delay=0 gdr-mode=false periodicity-idr=60 gop-length=60 filler-data=false ! \
+video/x-h265,alignment=au,profile=main ! \
+udpsink buffer-size=60000000 host=192.168.25.69 port=5004 async=false max-lateness=-1 qos-dscp=60
