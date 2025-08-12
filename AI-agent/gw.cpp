@@ -114,7 +114,7 @@ int main(int argc, char* argv[]) {
         "initial-delay", 250,
         "control-rate", 2, // low-latency
         "prefetch-buffer", TRUE,
-        "target-bitrate", 8000, // 8 Mbps
+        "target-bitrate", 8000000, // 8 Mbps
         "gop-mode", 1, // low-delay-p
         nullptr);
 
