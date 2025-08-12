@@ -7,71 +7,64 @@
 #include <stdlib.h>
 
 typedef struct {
-    GstElement *appsrc;
-    GstElement *appsink;
-    gboolean    video_info_valid;
+    GstElement  *appsrc;
+    GstElement  *appsink;
+    gboolean     video_info_valid;
     GstVideoInfo video_info;
-    GstClockTime t0;               // for fallback timestamping
+    guint64      frame_idx;     // <— add
+    GstClockTime base_pts;      // <— add
 } CustomData;
 
 static GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
-    CustomData *data = (CustomData *)user_data;
+    CustomData *d = (CustomData *)user_data;
 
     GstSample *sample = gst_app_sink_pull_sample(appsink);
     if (!sample) return GST_FLOW_ERROR;
 
-    GstBuffer *inbuf = gst_sample_get_buffer(sample);
-    if (!inbuf) { gst_sample_unref(sample); return GST_FLOW_ERROR; }
+    GstBuffer *in = gst_sample_get_buffer(sample);
+    if (!in) { gst_sample_unref(sample); return GST_FLOW_ERROR; }
 
-    // Propagate upstream caps (incl. framerate!) exactly once
-    if (!data->video_info_valid) {
+    if (!d->video_info_valid) {
         GstCaps *caps = gst_sample_get_caps(sample);
-        if (caps && gst_video_info_from_caps(&data->video_info, caps)) {
-            data->video_info_valid = TRUE;
+        if (caps && gst_video_info_from_caps(&d->video_info, caps)) {
+            d->video_info_valid = TRUE;
+            d->frame_idx = 0;
+            d->base_pts  = 0;
 
-            // Ensure framerate present; encoder pacing depends on it
-            gst_app_src_set_caps(GST_APP_SRC(data->appsrc), caps);
+            // propagate exact caps to appsrc
+            gst_app_src_set_caps(GST_APP_SRC(d->appsrc), caps);
 
-            // Give appsrc enough budget (roughly 4 frames)
-            guint64 frame_bytes = data->video_info.size;
-            guint64 budget = frame_bytes ? frame_bytes * 4ull : (16ull * 1024 * 1024);
-            g_object_set(data->appsrc, "max-bytes", budget, NULL);
+            // allow ~4 frames in flight
+            guint64 budget = (d->video_info.size ? d->video_info.size : (4*1024*1024)) * 4ull;
+            g_object_set(d->appsrc, "max-bytes", budget, NULL);
         } else {
             gst_sample_unref(sample);
             return GST_FLOW_ERROR;
         }
     }
 
-    // We will forward the SAME buffer (zero-copy): add a ref for appsrc
-    GstBuffer *outbuf = gst_buffer_ref(inbuf);
+    // Zero-copy pass-through: add a ref for appsrc
+    GstBuffer *out = gst_buffer_ref(in);
 
-    // Ensure stable timing: PTS + DURATION (and DTS if present)
-    // If upstream provided timing, prefer it; otherwise synthesize.
-    if (!GST_BUFFER_PTS_IS_VALID(outbuf)) {
-        if (data->t0 == GST_CLOCK_TIME_NONE) data->t0 = gst_util_get_timestamp();
-        GST_BUFFER_PTS(outbuf) = gst_util_get_timestamp() - data->t0;
-    }
-    if (!GST_BUFFER_DURATION_IS_VALID(outbuf)) {
-        // duration = 1/framerate
-        if (data->video_info.fps_n > 0 && data->video_info.fps_d > 0) {
-            GST_BUFFER_DURATION(outbuf) =
-                gst_util_uint64_scale_int(GST_SECOND, data->video_info.fps_d, data->video_info.fps_n);
-        } else {
-            // fallback to 60fps duration
-            GST_BUFFER_DURATION(outbuf) = GST_SECOND / 60;
-        }
-    }
-    // Optional: If DTS missing, set it equal to PTS for simple pass-through
-    if (!GST_BUFFER_DTS_IS_VALID(outbuf)) {
-        GST_BUFFER_DTS(outbuf) = GST_BUFFER_PTS(outbuf);
-    }
+    // Exact 60fps pacing from frame counter
+    guint fps_n = d->video_info.fps_n ? d->video_info.fps_n : 60;
+    guint fps_d = d->video_info.fps_d ? d->video_info.fps_d : 1;
+    GstClockTime dur = gst_util_uint64_scale_int(GST_SECOND, fps_d, fps_n);
 
-    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(data->appsrc), outbuf);
+    if (d->frame_idx == 0) d->base_pts = 0;  // start at 0 for a clean timeline
 
+    GstClockTime pts = d->base_pts + d->frame_idx * dur;
+
+    GST_BUFFER_PTS(out) = pts;
+    GST_BUFFER_DTS(out) = pts;
+    GST_BUFFER_DURATION(out) = dur;
+
+    d->frame_idx++;
+
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), out);
     gst_sample_unref(sample);
     return ret;
 }
-
 
 static void on_bus_msg(GstBus *bus, GstMessage *msg, gpointer user_data) {
     (void)bus; (void)user_data;
@@ -115,14 +108,10 @@ int main(int argc, char *argv[]) {
     GError *error = NULL;
 
     // Ingest pipeline: camera → appsink (keep 4K60 as you had it)
-    // const gchar *sink_pipeline_str =
-    //     "v4l2src device=/dev/video0 io-mode=4 ! "
-    //     "video/x-raw, format=NV12, width=1920, height=1080, framerate=60/1 ! "
-    //     "appsink name=my_sink emit-signals=true max-buffers=1 drop=true sync=false";
-    const gchar *sink_pipeline_str =
-    "v4l2src device=/dev/video0 io-mode=4 ! "
-    "video/x-raw, format=NV12, width=1920, height=1080, framerate=60/1 ! "
-    "appsink name=my_sink emit-signals=true max-buffers=4 drop=false sync=true";
+const gchar *sink_pipeline_str =
+  "v4l2src device=/dev/video0 io-mode=4 ! "
+  "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
+  "appsink name=my_sink emit-signals=true max-buffers=4 drop=false sync=true";
 
 
     GstElement *sink_pipeline = gst_parse_launch(sink_pipeline_str, &error);
@@ -135,31 +124,17 @@ int main(int argc, char *argv[]) {
 
     // Egress pipeline: appsrc → encoder → pay → UDP
     // NOTE: Keep your encoder knobs. Consider AU alignment for low-latency receivers (see commented line).
-    // gchar *src_pipeline_str = g_strdup_printf(
-    //     "appsrc name=my_src is-live=true block=true format=GST_FORMAT_TIME do-timestamp=true ! "
-    //     "queue max-size-buffers=2 leaky=downstream ! "
-    //     "omxh264enc skip-frame=true max-consecutive-skip=5 gop-mode=low-delay-p target-bitrate=%d num-slices=8 control-rate=Constant qp-mode=auto "
-    //     "prefetch-buffer=true cpb-size=200 initial-delay=200 gdr-mode=horizontal "
-    //     "periodicity-idr=30 gop-length=30 filler-data=true ! "
-    //     "video/x-h264, alignment=au, profile=main, stream-format=byte-stream ! "
-    //     // "video/x-h264, alignment=au, stream-format=byte-stream ! "   // <— try this for AU alignment
-    //     //"video/x-h264, alignment=nal ! "
-    //     "rtph264pay ! "
-    //     "udpsink buffer-size=60000000 host=192.168.25.69 port=5004 async=false max-lateness=-1 qos-dscp=60",
-    //     target_bitrate
-    // );
     gchar *src_pipeline_str = g_strdup_printf(
     "appsrc name=my_src is-live=true format=GST_FORMAT_TIME do-timestamp=false stream-type=0 ! "
-    "video/x-raw, format=NV12, width=1920, height=1080, framerate=60/1 ! "
+    "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
     "queue max-size-buffers=8 max-size-time=0 max-size-bytes=0 ! "
-    "omxh264enc num-slices=8 periodicity-idr=240 cpb-size=500 gdr-mode=horizontal "
-    "initial-delay=250 control-rate=low-latency prefetch-buffer=true target-bitrate=%d "
-    "gop-mode=low-delay-p ! "
-    "video/x-h264, alignment=au ! "
-    "rtph264pay ! "
+    "omxh264enc control-rate=constant target-bitrate=%d "
+    "gop-mode=low-delay-p periodicity-idr=60 gop-length=60 "
+    "num-slices=4 insert-sps-pps=true filler-data=true prefetch-buffer=true ! "
+    "video/x-h264,alignment=au,profile=main,stream-format=byte-stream ! "
+    "rtph264pay config-interval=1 pt=96 ! "
     "udpsink buffer-size=60000000 host=192.168.25.69 port=5004 async=false max-lateness=-1 qos-dscp=60",
-    target_bitrate
-);
+    target_bitrate);
 
 
     // pipeline_str = g_strdup_printf(
