@@ -1,169 +1,197 @@
-// nv12_relay_h265_min.cpp
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
-#include <gst/app/gstappsrc.h>
-#include <gst/video/video.h>
-#include <glib.h>
-#include <cstdio>
-#include <cstdlib>
+// build: g++ -std=c++17 -Wall -O2 pass_through_nv12.cpp -o pass_nv12 `pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0`
+// run:   ./pass_nv12 /dev/video0
 
-struct CustomData {
+#include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+#include <csignal>
+#include <cstdio>
+#include <string>
+
+struct Bridge {
     GstElement *appsrc = nullptr;
-    GstElement *appsink = nullptr;
-    gboolean caps_set_on_appsrc = FALSE;
+    gboolean caps_set = FALSE;
 };
 
-/* Bus logger */
-static gboolean bus_cb(GstBus *, GstMessage *msg, gpointer tag_ptr) {
-    const char *tag = (const char *)tag_ptr;
+static GMainLoop *loop = nullptr;
+
+static gboolean bus_cb(GstBus *bus, GstMessage *msg, gpointer user_data) {
+    (void)bus;
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_ERROR: {
             GError *err = nullptr; gchar *dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
-            g_printerr("[%s] ERROR: %s (debug: %s)\n", tag, err->message, dbg ? dbg : "none");
-            g_clear_error(&err); g_free(dbg);
+            g_printerr("ERROR from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+            if (dbg) { g_printerr("  debug: %s\n", dbg); g_free(dbg); }
+            g_error_free(err);
+            if (loop) g_main_loop_quit(loop);
             break;
         }
         case GST_MESSAGE_EOS:
-            g_print("[%s] EOS\n", tag);
+            g_print("EOS received\n");
+            if (loop) g_main_loop_quit(loop);
             break;
         default: break;
     }
     return TRUE;
 }
 
-/* appsink → appsrc relay (zero-copy, preserve timestamps). Set appsrc caps on first sample. */
-static GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
-    auto *data = (CustomData *)user_data;
+// appsink "new-sample" callback: forward buffer to appsrc with minimal overhead
+static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
+    Bridge *bridge = static_cast<Bridge*>(user_data);
 
     GstSample *sample = gst_app_sink_pull_sample(appsink);
     if (!sample) return GST_FLOW_ERROR;
 
-    if (!data->caps_set_on_appsrc) {
-        GstCaps *caps = gst_sample_get_caps(sample);
-        if (!caps) {
-            g_printerr("Sample had no caps\n");
-            gst_sample_unref(sample);
-            return GST_FLOW_ERROR;
-        }
-        gst_app_src_set_caps(GST_APP_SRC(data->appsrc), gst_caps_copy(caps));
-        data->caps_set_on_appsrc = TRUE;
-    }
-
-    GstBuffer *in_buf = gst_sample_get_buffer(sample);
-    if (!in_buf) {
+    GstBuffer *inbuf = gst_sample_get_buffer(sample);
+    GstCaps   *caps  = gst_sample_get_caps(sample);
+    if (!inbuf || !caps) {
         gst_sample_unref(sample);
         return GST_FLOW_ERROR;
     }
 
-    GstBuffer *out_buf = gst_buffer_ref(in_buf); // zero-copy handoff
-    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(data->appsrc), out_buf);
+    // Set appsrc caps once (exactly match upstream caps)
+    if (!bridge->caps_set) {
+        g_object_set(bridge->appsrc, "caps", caps, NULL);
+        bridge->caps_set = TRUE;
+        // Optional: print negotiated caps
+        gchar *s = gst_caps_to_string(caps);
+        g_print("Appsrc caps set to: %s\n", s);
+        g_free(s);
+    }
+
+    // Forward timestamps to preserve pacing across the bridge
+    // We will reuse the same buffer (zero-copy) by ref'ing it.
+    gst_buffer_ref(inbuf);
+
+    // Push straight into appsrc
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(bridge->appsrc), inbuf);
+
+    // Drop our sample reference
     gst_sample_unref(sample);
-    return ret;
+
+    if (ret != GST_FLOW_OK) {
+        // If downstream is not ready, you might see FLUSHING during state changes; treat as non-fatal.
+        if (ret == GST_FLOW_FLUSHING) return GST_FLOW_OK;
+        g_printerr("appsrc push returned %d\n", ret);
+    }
+    return GST_FLOW_OK;
 }
 
-int main(int argc, char *argv[]) {
+static void handle_sigint(int) {
+    if (loop) g_main_loop_quit(loop);
+}
+
+int main(int argc, char **argv) {
     gst_init(&argc, &argv);
+    signal(SIGINT, handle_sigint);
 
-    /* Defaults: only --fps and --bitrate are supported */
-    gint fps = 60;           // camera is 60; use --fps=30 to drop via videorate
-    gint bitrate_kbps = 8000;
-    const char *host = "192.168.25.69";
-    const gint   port = 5004;
+    const char *device = (argc > 1) ? argv[1] : "/dev/video0";
 
-    for (int i = 1; i < argc; ++i) {
-        if (g_str_has_prefix(argv[i], "--fps="))       fps = atoi(argv[i] + 6);
-        else if (g_str_has_prefix(argv[i], "--bitrate=")) bitrate_kbps = atoi(argv[i] + 10);
-    }
-    if (fps <= 0 || bitrate_kbps <= 0) {
-        g_printerr("Usage: %s --fps=<N> --bitrate=<kbps>\n", argv[0]);
-        return 1;
-    }
-    g_print("Config: fps=%d, bitrate=%d kbps, dst=%s:%d\n", fps, bitrate_kbps, host, port);
-    g_print("Note: Set resolution beforehand with media-ctl (4K or 1080p).\n");
+    // ---- Pipeline A: capture → appsink (NV12, 1920x1080@60) ----
+    // io-mode=4 (DMABuf) if supported by your v4l2 driver; safe to keep even if it falls back.
+    std::string pipeA_desc =
+        "v4l2src name=cam io-mode=4 ! "
+        "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
+        "queue max-size-buffers=2 leaky=downstream ! "
+        "appsink name=cv_sink emit-signals=true sync=false max-buffers=1 drop=true";
 
-    CustomData data;
     GError *err = nullptr;
-
-    /* Capture → (optional) videorate drop → caps(fps) → appsink
-       - No width/height here: we take whatever resolution media-ctl configured (4K or 1080p).
-       - io-mode=2 (SystemMemory) is robust across the appsink/appsrc boundary.
-    */
-    gchar *sink_pipeline_str = nullptr;
-    if (fps < 60) {
-        sink_pipeline_str = g_strdup_printf(
-            "v4l2src device=/dev/video0 io-mode=2 ! "
-            "video/x-raw,format=NV12,framerate=60/1 ! "
-            "videorate drop-only=true max-rate=%d ! "
-            "video/x-raw,format=NV12,framerate=%d/1 ! "
-            "appsink name=relay_sink emit-signals=true max-buffers=1 drop=true sync=false",
-            fps, fps);
-    } else {
-        sink_pipeline_str = g_strdup(
-            "v4l2src device=/dev/video0 io-mode=2 ! "
-            "video/x-raw,format=NV12,framerate=60/1 ! "
-            "appsink name=relay_sink emit-signals=true max-buffers=1 drop=true sync=false");
-    }
-
-    GstElement *sink_pipeline = gst_parse_launch(sink_pipeline_str, &err);
-    g_free(sink_pipeline_str);
-    if (!sink_pipeline) {
-        g_printerr("Create sink pipeline failed: %s\n", err ? err->message : "unknown");
+    GstElement *pipeA = gst_parse_launch(pipeA_desc.c_str(), &err);
+    if (!pipeA) {
+        g_printerr("Failed to create capture pipeline: %s\n", err ? err->message : "unknown");
         if (err) g_clear_error(&err);
         return 1;
     }
-    data.appsink = gst_bin_get_by_name(GST_BIN(sink_pipeline), "relay_sink");
 
-    /* appsrc → tiny leaky queue → H.265 encoder → RTP → UDP
-       - appsrc caps set dynamically from first sample (so width/height match media-ctl result)
-       - do-timestamp=false to preserve upstream PTS/DTS from v4l2src/videorate
-    */
-    gchar *src_pipeline_str = g_strdup_printf(
-        "appsrc name=relay_src is-live=true format=GST_FORMAT_TIME do-timestamp=false block=false "
-        "! queue leaky=2 max-size-buffers=4 "
-        "! video/x-raw,format=NV12 "
-        "! omxh265enc num-slices=8 periodicity-idr=240 cpb-size=500 gdr-mode=horizontal "
-        "              initial-delay=250 control-rate=low-latency prefetch-buffer=true "
-        "              target-bitrate=%d gop-mode=low-delay-p "
-        "! video/x-h265,alignment=au "
-        "! rtph265pay pt=96 config-interval=1 "
-        "! udpsink buffer-size=60000000 host=%s port=%d async=false qos-dscp=60",
-        bitrate_kbps, host, port);
-
-    GstElement *src_pipeline = gst_parse_launch(src_pipeline_str, &err);
-    g_free(src_pipeline_str);
-    if (!src_pipeline) {
-        g_printerr("Create src pipeline failed: %s\n", err ? err->message : "unknown");
-        if (err) g_clear_error(&err);
-        gst_object_unref(sink_pipeline);
+    GstElement *appsink = gst_bin_get_by_name(GST_BIN(pipeA), "cv_sink");
+    if (!appsink) {
+        g_printerr("appsink not found\n");
         return 1;
     }
-    data.appsrc = gst_bin_get_by_name(GST_BIN(src_pipeline), "relay_src");
 
-    /* Hook relay callback */
-    g_signal_connect(data.appsink, "new-sample", G_CALLBACK(new_sample_cb), &data);
+    // ---- Pipeline B: appsrc → omxh264enc → RTP → UDP ----
+    // Note: use your platform’s encoder element (omxh264enc assumed).
+    // `clients=192.168.25.69:5004` sends to the requested destination.
+    std::string pipeB_desc =
+        "appsrc name=cv_src is-live=true do-timestamp=true format=time block=true "
+        "min-latency=0 max-latency=0 ! "
+        "queue max-size-buffers=2 leaky=downstream ! "
+        "omxh264enc "
+            "control-rate=low-latency "
+            "gop-mode=basic "
+            "periodicity-idr=120 "
+            "target-bitrate=10000 "
+            "prefetch-buffer=true "
+        " ! video/x-h264,stream-format=byte-stream,alignment=au "
+        " ! h264parse config-interval=-1 "
+        " ! rtph264pay pt=96 config-interval=-1 "
+        " ! udpsink clients=192.168.25.69:5004 sync=false async=false";
 
-    /* Bus watches */
-    GstBus *busA = gst_element_get_bus(sink_pipeline);
-    GstBus *busB = gst_element_get_bus(src_pipeline);
-    gst_bus_add_watch(busA, bus_cb, (gpointer)"CAPTURE");
-    gst_bus_add_watch(busB, bus_cb, (gpointer)"ENCODER");
-    gst_object_unref(busA);
-    gst_object_unref(busB);
+    GstElement *pipeB = gst_parse_launch(pipeB_desc.c_str(), &err);
+    if (!pipeB) {
+        g_printerr("Failed to create encoder pipeline: %s\n", err ? err->message : "unknown");
+        if (err) g_clear_error(&err);
+        gst_object_unref(appsink);
+        gst_object_unref(pipeA);
+        return 1;
+    }
 
-    /* Start pipelines */
-    gst_element_set_state(src_pipeline,  GST_STATE_PLAYING);
-    gst_element_set_state(sink_pipeline, GST_STATE_PLAYING);
+    GstElement *appsrc = gst_bin_get_by_name(GST_BIN(pipeB), "cv_src");
+    if (!appsrc) {
+        g_printerr("appsrc not found\n");
+        gst_object_unref(pipeB);
+        gst_object_unref(appsink);
+        gst_object_unref(pipeA);
+        return 1;
+    }
 
-    g_print("Running… Ctrl+C to quit\n");
-    GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
+    // (Optional) Pre-set appsrc caps to match our target; they will be overwritten by exact caps from first sample
+    {
+        GstCaps *caps = gst_caps_new_simple("video/x-raw",
+            "format",    G_TYPE_STRING, "NV12",
+            "width",     G_TYPE_INT,     1920,
+            "height",    G_TYPE_INT,     1080,
+            "framerate", GST_TYPE_FRACTION, 60, 1,
+            NULL);
+        g_object_set(appsrc, "caps", caps, NULL);
+        gst_caps_unref(caps);
+    }
+
+    // Wire callback
+    Bridge bridge;
+    bridge.appsrc = appsrc;
+    GstAppSinkCallbacks cbs = {};
+    cbs.eos = nullptr;
+    cbs.new_preroll = nullptr;
+    cbs.new_sample = on_new_sample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &cbs, &bridge, nullptr);
+
+    // Buses for both pipelines
+    GstBus *busA = gst_element_get_bus(pipeA);
+    GstBus *busB = gst_element_get_bus(pipeB);
+    gst_bus_add_watch(busA, bus_cb, nullptr);
+    gst_bus_add_watch(busB, bus_cb, nullptr);
+
+    // Set both to PLAYING (encoder first so appsrc has a consumer)
+    gst_element_set_state(pipeB, GST_STATE_PLAYING);
+    gst_element_set_state(pipeA, GST_STATE_PLAYING);
+
+    g_print("Running… Ctrl+C to stop.\n");
+    loop = g_main_loop_new(nullptr, FALSE);
     g_main_loop_run(loop);
 
-    /* Cleanup */
+    // Tear down
+    gst_element_send_event(pipeB, gst_event_new_eos());
+    gst_element_set_state(pipeA, GST_STATE_NULL);
+    gst_element_set_state(pipeB, GST_STATE_NULL);
+    gst_object_unref(busA);
+    gst_object_unref(busB);
+    gst_object_unref(appsink);
+    gst_object_unref(appsrc);
+    gst_object_unref(pipeA);
+    gst_object_unref(pipeB);
     g_main_loop_unref(loop);
-    gst_element_set_state(sink_pipeline, GST_STATE_NULL);
-    gst_element_set_state(src_pipeline,  GST_STATE_NULL);
-    gst_object_unref(sink_pipeline);
-    gst_object_unref(src_pipeline);
     return 0;
 }

@@ -84,7 +84,7 @@ int main(int argc, char *argv[]) {
     // Create two bins: one for capture, one for encoding/streaming
     GstBin *capture_bin = GST_BIN(gst_bin_new("capture-bin"));
     GstBin *stream_bin = GST_BIN(gst_bin_new("stream-bin"));
-
+8
     gst_bin_add_many(capture_bin, src, capsfilter, appsink, nullptr);
     gst_bin_add_many(stream_bin, appsrc, encoder, rtppay, udpsink, nullptr);
 
