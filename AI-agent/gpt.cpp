@@ -132,22 +132,30 @@ int main(int argc, char **argv) {
         NULL);
 
     // omxh264enc: copy *exactly* your knobs
-    g_object_set(enc,
-        "num-slices", 8,
-        "periodicity-idr", 240,
-        "cpb-size", 500,
-        "gdr-mode", 1 /* horizontal (enum value on many omx builds) */,
-        "initial-delay", 250,
-        "control-rate", 2 /* low-latency */,
-        "prefetch-buffer", TRUE,
-        "target-bitrate", bitrate_bps,
-        "gop-mode", 2 /* low-delay-p on many omx builds */,
-        NULL);
+    // … previous setup (v4l2src, caps, appsink/appsrc, queue, pay, udp) unchanged …
 
-    // h264 caps alignment=nal (as per your line)
+    // --- Encoder: set properties as STRINGS (match gst-launch) ---
+    // And set target-bitrate in *kbps* to match your working pipeline.
+    g_object_set(enc,
+        "num-slices",        8,
+        "periodicity-idr",   240,
+        "cpb-size",          500,
+        "initial-delay",     250,
+        "prefetch-buffer",   TRUE,
+        // string enums (these are the keys that often break init if passed as ints)
+        NULL);
+    gst_util_set_object_arg(G_OBJECT(enc), "control-rate",  "low-latency");
+    gst_util_set_object_arg(G_OBJECT(enc), "gop-mode",      "low-delay-p");
+    gst_util_set_object_arg(G_OBJECT(enc), "gdr-mode",      "horizontal");
+
+    // IMPORTANT: kbps, to match your gst-launch behavior (e.g., 8000 => ~8 Mbps)
+    g_object_set(enc, "target-bitrate", bitrate_kbps, NULL);
+
+    // H.264 caps: alignment=nal (same as your gst-launch)
     GstCaps *c264 = gst_caps_from_string("video/x-h264, alignment=nal");
     g_object_set(cap_h264, "caps", c264, NULL);
     gst_caps_unref(c264);
+
 
     // rtph264pay: defaults are okay (same as your gst-launch)
     // udpsink: mirror your socket/buffering/QoS params
