@@ -99,26 +99,25 @@ int main(int argc, char *argv[]) {
 
   // 2. Define the pipelines
   // Capture Pipeline: v4l2src -> capsfilter -> appsink
-  // We use 'v4l2src' for capturing from a V4L2 device (like a camera).
-  // The 'appsink' element is configured to emit signals so our callback is triggered.
+  // We use 'v4l2src' with io-mode=4 (DMABUF) for zero-copy capture.
+  // The 'appsink' is tuned to drop frames if the consumer is too slow.
   const char *capture_pipeline_str = 
-    "v4l2src device=/dev/video0 ! "
+    "v4l2src device=/dev/video0 io-mode=4 ! "
     "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
-    "appsink name=receiversink emit-signals=true sync=false";
+    "appsink name=receiversink emit-signals=true max-buffers=2 drop=true sync=false";
 
   // Stream Pipeline: appsrc -> capsfilter -> encoder -> payloader -> udpsink
-  // 'appsrc' is where we will feed the video data from the first pipeline.
-  // 'omxh264enc' is a hardware-accelerated H.264 encoder with a target bitrate of 10Mbps.
-  // 'rtph264pay' packetizes the H.264 stream into RTP packets.
-  // 'udpsink' sends the RTP packets over the network to the specified client.
+  // 'appsrc' is set to block, creating backpressure to the sink.
+  // 'omxh264enc' is tuned with properties from the working gst-launch command for low latency and performance.
+  // 'udpsink' is tuned for high-throughput streaming.
   const char *stream_pipeline_str = 
-    "appsrc name=sendersrc format=time ! "
+    "appsrc name=sendersrc format=time is-live=true block=true ! "
     "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
-    "omxh264enc target-bitrate=10000 ! "
-    "video/x-h264,stream-format=byte-stream ! "
+    "omxh264enc target-bitrate=10000000 num-slices=8 periodicity-idr=240 cpb-size=500 gdr-mode=horizontal initial-delay=250 control-rate=low-latency prefetch-buffer=true gop-mode=low-delay-p ! "
+    "video/x-h264,alignment=nal,stream-format=byte-stream ! "
     "h264parse ! "
     "rtph264pay config-interval=-1 ! "
-    "udpsink host=192.168.25.69 port=5004 sync=false";
+    "udpsink host=192.168.25.69 port=5004 buffer-size=60000000 max-lateness=-1 qos-dscp=60 sync=false";
 
   // 3. Create the pipeline elements
   data.capture_pipeline = gst_parse_launch(capture_pipeline_str, NULL);

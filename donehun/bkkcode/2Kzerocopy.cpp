@@ -111,6 +111,7 @@ int main(int argc, char *argv[]) {
 const gchar *sink_pipeline_str =
   "v4l2src device=/dev/video0 io-mode=4 ! "
   "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
+  "videorate drop-only=true max-rate=60"
   "appsink name=my_sink emit-signals=true max-buffers=4 drop=false sync=true";
 
 
