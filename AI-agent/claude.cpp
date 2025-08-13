@@ -112,18 +112,47 @@ public:
             nullptr);
         gst_caps_unref(src_caps);
         
-        // Configure H.264 encoder - match your working pipeline exactly
+        // Configure H.264 encoder - step by step to identify issues
+        // Start with basic settings first
         g_object_set(h264_encoder,
-            "num-slices", 8,
-            "periodicity-idr", 240,
-            "cpb-size", 500,
-            "gdr-mode", 1,  // horizontal
-            "initial-delay", 250,
-            "control-rate", 3,  // low-latency
-            "prefetch-buffer", TRUE,
-            "target-bitrate", TARGET_BITRATE / 1000,  // Convert to kbps
-            "gop-mode", 1,  // low-delay-p
+            "target-bitrate", TARGET_BITRATE / 1000,  // 10000 kbps
+            "control-rate", 2,  // constant bitrate (more compatible than low-latency)
             nullptr);
+        
+        // Add advanced settings one by one with error checking
+        GValue val = G_VALUE_INIT;
+        
+        // Try to set periodicity-idr
+        g_value_init(&val, G_TYPE_UINT);
+        g_value_set_uint(&val, 240);
+        g_object_set_property(G_OBJECT(h264_encoder), "periodicity-idr", &val);
+        g_value_unset(&val);
+        
+        // Try to set num-slices
+        g_value_init(&val, G_TYPE_UINT);
+        g_value_set_uint(&val, 8);
+        g_object_set_property(G_OBJECT(h264_encoder), "num-slices", &val);
+        g_value_unset(&val);
+        
+        // Try other settings with fallbacks
+        g_object_set(h264_encoder,
+            "prefetch-buffer", TRUE,
+            nullptr);
+            
+        // Optional advanced settings - only set if supported
+        GObjectClass *encoder_class = G_OBJECT_GET_CLASS(h264_encoder);
+        if (g_object_class_find_property(encoder_class, "cpb-size")) {
+            g_object_set(h264_encoder, "cpb-size", 500, nullptr);
+        }
+        if (g_object_class_find_property(encoder_class, "initial-delay")) {
+            g_object_set(h264_encoder, "initial-delay", 250, nullptr);
+        }
+        if (g_object_class_find_property(encoder_class, "gdr-mode")) {
+            g_object_set(h264_encoder, "gdr-mode", 1, nullptr);  // horizontal
+        }
+        if (g_object_class_find_property(encoder_class, "gop-mode")) {
+            g_object_set(h264_encoder, "gop-mode", 1, nullptr);  // low-delay-p
+        }
         
         // Configure H.264 caps filter
         GstCaps *h264_caps = gst_caps_from_string("video/x-h264,alignment=nal");
@@ -300,17 +329,50 @@ public:
         // Start processing thread with high priority
         processing_thread = std::thread(&VideoStreamer::processing_loop, this);
         
-        // Set thread priority (requires root or CAP_SYS_NICE)
-        pthread_t native_handle = processing_thread.native_handle();
-        struct sched_param param;
-        param.sched_priority = 10;
-        pthread_setschedparam(native_handle, SCHED_FIFO, &param);
+        // Try to set thread priority (optional - don't fail if not possible)
+        try {
+            pthread_t native_handle = processing_thread.native_handle();
+            struct sched_param param;
+            param.sched_priority = 10;
+            int result = pthread_setschedparam(native_handle, SCHED_FIFO, &param);
+            if (result != 0) {
+                std::cout << "Note: Could not set high thread priority (run as root for better performance)" << std::endl;
+            }
+        } catch (...) {
+            std::cout << "Note: Thread priority setting not available" << std::endl;
+        }
         
-        // Set pipeline to playing state
+        // Set pipeline to playing state with better error handling
         std::cout << "Setting pipeline to READY state..." << std::endl;
         GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_READY);
         if (ret == GST_STATE_CHANGE_FAILURE) {
             std::cerr << "Failed to set pipeline to ready state" << std::endl;
+            
+            // Try to get more detailed error information
+            GstMessage *msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
+            if (msg) {
+                GError *err;
+                gchar *debug_info;
+                gst_message_parse_error(msg, &err, &debug_info);
+                std::cerr << "Detailed error: " << err->message << std::endl;
+                if (debug_info) {
+                    std::cerr << "Debug info: " << debug_info << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug_info);
+                gst_message_unref(msg);
+            }
+            
+            running = false;
+            return false;
+        }
+        
+        // Wait for READY state
+        GstState state;
+        ret = gst_element_get_state(pipeline, &state, nullptr, 5 * GST_SECOND);
+        if (ret == GST_STATE_CHANGE_FAILURE || state != GST_STATE_READY) {
+            std::cerr << "Pipeline failed to reach ready state. Current state: " 
+                      << gst_element_state_get_name(state) << std::endl;
             running = false;
             return false;
         }
@@ -319,15 +381,32 @@ public:
         ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
         if (ret == GST_STATE_CHANGE_FAILURE) {
             std::cerr << "Failed to set pipeline to playing state" << std::endl;
+            
+            // Try to get more detailed error information
+            GstMessage *msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
+            if (msg) {
+                GError *err;
+                gchar *debug_info;
+                gst_message_parse_error(msg, &err, &debug_info);
+                std::cerr << "Detailed error: " << err->message << std::endl;
+                if (debug_info) {
+                    std::cerr << "Debug info: " << debug_info << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug_info);
+                gst_message_unref(msg);
+            }
+            
             running = false;
             return false;
         }
         
-        // Wait for pipeline to reach playing state
-        GstState state;
-        ret = gst_element_get_state(pipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
+        // Wait for pipeline to reach playing state with timeout
+        ret = gst_element_get_state(pipeline, &state, nullptr, 10 * GST_SECOND);
         if (ret != GST_STATE_CHANGE_SUCCESS || state != GST_STATE_PLAYING) {
-            std::cerr << "Pipeline failed to reach playing state" << std::endl;
+            std::cerr << "Pipeline failed to reach playing state within timeout. Current state: " 
+                      << gst_element_state_get_name(state) << std::endl;
+            std::cerr << "State change return: " << ret << std::endl;
             running = false;
             return false;
         }
@@ -335,8 +414,13 @@ public:
         std::cout << "Video streaming started successfully!" << std::endl;
         std::cout << "Capturing 1920x1080@60fps NV12 -> H.264 @ " << TARGET_BITRATE/1000000 << "Mbps -> UDP 192.168.25.69:5004" << std::endl;
         
-        // Create main loop
+        // Create main loop with proper initialization
         loop = g_main_loop_new(nullptr, FALSE);
+        if (!loop) {
+            std::cerr << "Failed to create main loop" << std::endl;
+            running = false;
+            return false;
+        }
         
         return true;
     }
@@ -490,7 +574,7 @@ private:
             pipeline = nullptr;
         }
         
-        if (loop) {
+        if (loop && g_main_loop_get_context(loop)) {
             g_main_loop_unref(loop);
             loop = nullptr;
         }
