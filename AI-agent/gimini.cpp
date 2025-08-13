@@ -13,11 +13,11 @@ typedef struct _CustomData {
 
 /**
  * @brief This callback function is called when new data is available from the appsink.
- * * This function is the core of the application. It retrieves the video sample
+ * This function is the core of the application. It retrieves the video sample
  * from the capture pipeline's appsink and immediately pushes it to the
  * streaming pipeline's appsrc. This forwarding is very efficient as it
  * avoids memory copies of the video buffer itself.
- * * @param sink The GstAppSink element that triggered the signal.
+ * @param sink The GstAppSink element that triggered the signal.
  * @param data A pointer to our custom data structure.
  * @return GstFlowReturn GST_FLOW_OK on success, or an error code.
  */
@@ -46,19 +46,47 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer data) {
 }
 
 /**
- * @brief This function is called when an error message is posted on the bus.
+ * @brief This function is called when a message is posted on the bus.
+ * We handle different message types here.
  */
-static void error_cb(GstBus *bus, GstMessage *msg, CustomData *data) {
-    GError *err;
-    gchar *debug_info;
+static void bus_cb(GstBus *bus, GstMessage *msg, CustomData *data) {
+    switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+            GError *err;
+            gchar *debug_info;
 
-    gst_message_parse_error(msg, &err, &debug_info);
-    g_printerr("Error received from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
-    g_printerr("Debugging information: %s\n", debug_info ? debug_info : "none");
-    g_clear_error(&err);
-    g_free(debug_info);
+            // This is the correct way to handle errors.
+            // We parse the error message and print it.
+            gst_message_parse_error(msg, &err, &debug_info);
+            g_printerr("Error received from element %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+            g_printerr("Debugging information: %s\n", debug_info ? debug_info : "none");
+            g_clear_error(&err);
+            g_free(debug_info);
 
-    g_main_loop_quit(data->main_loop);
+            g_main_loop_quit(data->main_loop);
+            break;
+        }
+        case GST_MESSAGE_EOS:
+            // Handle End-Of-Stream
+            g_print("End-Of-Stream reached on %s.\n", GST_OBJECT_NAME(msg->src));
+            // We don't quit the main loop here, as one pipeline might end before the other.
+            // The application will be terminated by Ctrl+C or a critical error.
+            break;
+        case GST_MESSAGE_STATE_CHANGED:
+            // We are only interested in state-changed messages from the pipeline
+            if (GST_MESSAGE_SRC(msg) == GST_OBJECT(data->capture_pipeline) || GST_MESSAGE_SRC(msg) == GST_OBJECT(data->stream_pipeline)) {
+                GstState old_state, new_state, pending_state;
+                gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
+                g_print("Pipeline '%s' state changed from %s to %s.\n",
+                    GST_OBJECT_NAME(msg->src),
+                    gst_element_state_get_name(old_state),
+                    gst_element_state_get_name(new_state));
+            }
+            break;
+        default:
+            // We are not interested in other messages
+            break;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -80,13 +108,13 @@ int main(int argc, char *argv[]) {
 
   // Stream Pipeline: appsrc -> capsfilter -> encoder -> payloader -> udpsink
   // 'appsrc' is where we will feed the video data from the first pipeline.
-  // 'omxh264enc' is a hardware-accelerated H.264 encoder.
+  // 'omxh264enc' is a hardware-accelerated H.264 encoder with a target bitrate of 10Mbps.
   // 'rtph264pay' packetizes the H.264 stream into RTP packets.
   // 'udpsink' sends the RTP packets over the network to the specified client.
   const char *stream_pipeline_str = 
     "appsrc name=sendersrc format=time ! "
     "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1 ! "
-    "omxh264enc ! "
+    "omxh264enc target-bitrate=10000 ! "
     "video/x-h264,stream-format=byte-stream ! "
     "h264parse ! "
     "rtph264pay config-interval=-1 ! "
@@ -118,13 +146,13 @@ int main(int argc, char *argv[]) {
   // 6. Create a GMainLoop
   data.main_loop = g_main_loop_new(NULL, FALSE);
 
-  // 7. Add message handlers for errors
+  // 7. Add message handlers for the buses
   bus_capture = gst_element_get_bus(data.capture_pipeline);
-  gst_bus_add_watch(bus_capture, (GstBusFunc)error_cb, &data);
+  gst_bus_add_watch(bus_capture, (GstBusFunc)bus_cb, &data);
   gst_object_unref(bus_capture);
 
   bus_stream = gst_element_get_bus(data.stream_pipeline);
-  gst_bus_add_watch(bus_stream, (GstBusFunc)error_cb, &data);
+  gst_bus_add_watch(bus_stream, (GstBusFunc)bus_cb, &data);
   gst_object_unref(bus_stream);
   
   // 8. Start playing both pipelines
@@ -140,7 +168,7 @@ int main(int argc, char *argv[]) {
   // 10. Cleanup
   std::cout << "Stopping pipelines..." << std::endl;
   gst_object_unref(app_sink);
-  gst_object_unref(data.app_source);
+  // app_source is part of the pipeline and will be unref'd with it
   gst_element_set_state(data.capture_pipeline, GST_STATE_NULL);
   gst_element_set_state(data.stream_pipeline, GST_STATE_NULL);
   gst_object_unref(data.capture_pipeline);

@@ -1,48 +1,54 @@
 #include <gst/gst.h>
-#include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
 #include <iostream>
 #include <thread>
 #include <atomic>
-#include <memory>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include <chrono>
 
 class VideoStreamer {
 private:
     GstElement *pipeline;
-    GstElement *camera_src;
-    GstElement *camera_caps;
-    GstElement *appsink;
-    GstElement *appsrc;
-    GstElement *encoder;
-    GstElement *encoder_caps;
+    GstElement *camera_source;
+    GstElement *caps_filter1;
+    GstElement *app_sink;
+    GstElement *app_src;
+    GstElement *h264_encoder;
+    GstElement *caps_filter2;
     GstElement *rtp_payloader;
     GstElement *udp_sink;
     
     GstBus *bus;
-    GMainLoop *main_loop;
+    GMainLoop *loop;
     
-    std::atomic<bool> running{false};
-    std::thread bus_thread;
+    // Threading and synchronization
+    std::atomic<bool> running;
+    std::queue<GstBuffer*> buffer_queue;
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::thread processing_thread;
     
-    // Performance optimization members
-    static constexpr int BUFFER_POOL_SIZE = 10;
-    GstBufferPool *buffer_pool;
+    // Performance monitoring
+    std::atomic<uint64_t> frames_processed;
+    std::atomic<uint64_t> frames_dropped;
+    std::chrono::steady_clock::time_point start_time;
     
+    static const size_t MAX_QUEUE_SIZE = 5; // Reduced queue size for better performance
+    static const uint64_t TARGET_BITRATE = 10000000; // 10 Mbps
+
 public:
-    VideoStreamer() : pipeline(nullptr), main_loop(nullptr), buffer_pool(nullptr) {}
+    VideoStreamer() : pipeline(nullptr), running(false), frames_processed(0), frames_dropped(0) {
+        gst_init(nullptr, nullptr);
+    }
     
     ~VideoStreamer() {
         cleanup();
     }
     
     bool initialize() {
-        // Initialize GStreamer
-        gst_init(nullptr, nullptr);
-        
-        // Create main loop
-        main_loop = g_main_loop_new(nullptr, FALSE);
-        
         // Create pipeline
         pipeline = gst_pipeline_new("video-streamer");
         if (!pipeline) {
@@ -51,34 +57,233 @@ public:
         }
         
         // Create elements
-        if (!createElement()) {
+        camera_source = gst_element_factory_make("v4l2src", "camera-source");
+        caps_filter1 = gst_element_factory_make("capsfilter", "caps-filter1");
+        app_sink = gst_element_factory_make("appsink", "app-sink");
+        app_src = gst_element_factory_make("appsrc", "app-src");
+        h264_encoder = gst_element_factory_make("omxh264enc", "h264-encoder");
+        caps_filter2 = gst_element_factory_make("capsfilter", "caps-filter2");
+        rtp_payloader = gst_element_factory_make("rtph264pay", "rtp-payloader");
+        udp_sink = gst_element_factory_make("udpsink", "udp-sink");
+        
+        if (!camera_source || !caps_filter1 || !app_sink || !app_src || 
+            !h264_encoder || !caps_filter2 || !rtp_payloader || !udp_sink) {
+            std::cerr << "Failed to create one or more elements" << std::endl;
             return false;
         }
         
-        // Set properties
-        if (!setElementProperties()) {
-            return false;
-        }
+        // Configure camera source - match your working pipeline
+        g_object_set(camera_source, 
+            "device", "/dev/video0",
+            "io-mode", 4,  // GST_V4L2_IO_DMABUF_IMPORT for better performance
+            nullptr);
+        
+        // Configure input caps filter for 1920x1080@60fps NV12
+        GstCaps *input_caps = gst_caps_from_string("video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1");
+        g_object_set(caps_filter1, "caps", input_caps, nullptr);
+        gst_caps_unref(input_caps);
+        
+        // Configure appsink - optimized for high performance
+        g_object_set(app_sink,
+            "emit-signals", TRUE,
+            "sync", FALSE,
+            "async", FALSE,
+            "drop", TRUE,
+            "max-buffers", 2,  // Minimal buffering
+            "wait-on-eos", FALSE,
+            nullptr);
+        
+        // Set appsink caps to ensure format consistency
+        GstCaps *sink_caps = gst_caps_from_string("video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1");
+        gst_app_sink_set_caps(GST_APP_SINK(app_sink), sink_caps);
+        gst_caps_unref(sink_caps);
+        
+        // Configure appsrc - match the input stream characteristics
+        GstCaps *src_caps = gst_caps_from_string("video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1");
+        g_object_set(app_src,
+            "caps", src_caps,
+            "format", GST_FORMAT_TIME,
+            "is-live", TRUE,
+            "do-timestamp", TRUE,
+            "min-latency", 0,
+            "max-latency", 0,
+            "block", FALSE,
+            "stream-type", GST_APP_STREAM_TYPE_STREAM,
+            nullptr);
+        gst_caps_unref(src_caps);
+        
+        // Configure H.264 encoder - match your working pipeline exactly
+        g_object_set(h264_encoder,
+            "num-slices", 8,
+            "periodicity-idr", 240,
+            "cpb-size", 500,
+            "gdr-mode", 1,  // horizontal
+            "initial-delay", 250,
+            "control-rate", 3,  // low-latency
+            "prefetch-buffer", TRUE,
+            "target-bitrate", TARGET_BITRATE / 1000,  // Convert to kbps
+            "gop-mode", 1,  // low-delay-p
+            nullptr);
+        
+        // Configure H.264 caps filter
+        GstCaps *h264_caps = gst_caps_from_string("video/x-h264,alignment=nal");
+        g_object_set(caps_filter2, "caps", h264_caps, nullptr);
+        gst_caps_unref(h264_caps);
+        
+        // Configure RTP payloader
+        g_object_set(rtp_payloader,
+            "pt", 96,
+            "config-interval", -1,  // Send SPS/PPS with every IDR
+            nullptr);
+        
+        // Configure UDP sink - match your working pipeline
+        g_object_set(udp_sink,
+            "buffer-size", 60000000,
+            "host", "192.168.25.69",
+            "port", 5004,
+            "async", FALSE,
+            "max-lateness", -1,
+            "qos-dscp", 60,
+            "sync", FALSE,
+            nullptr);
         
         // Add elements to pipeline
         gst_bin_add_many(GST_BIN(pipeline),
-            camera_src, camera_caps, appsink,
-            appsrc, encoder, encoder_caps, 
-            rtp_payloader, udp_sink, nullptr);
+            camera_source, caps_filter1, app_sink,
+            app_src, h264_encoder, caps_filter2, rtp_payloader, udp_sink,
+            nullptr);
         
-        // Link elements
-        if (!linkElements()) {
+        // Link capture pipeline
+        if (!gst_element_link_many(camera_source, caps_filter1, app_sink, nullptr)) {
+            std::cerr << "Failed to link capture pipeline" << std::endl;
             return false;
         }
         
-        // Set up callbacks
-        setupCallbacks();
+        // Link streaming pipeline
+        if (!gst_element_link_many(app_src, h264_encoder, caps_filter2, 
+                                   rtp_payloader, udp_sink, nullptr)) {
+            std::cerr << "Failed to link streaming pipeline" << std::endl;
+            return false;
+        }
         
-        // Set up bus
-        setupBus();
+        // Connect appsink callback
+        g_signal_connect(app_sink, "new-sample", G_CALLBACK(on_new_sample), this);
         
-        std::cout << "GStreamer pipeline initialized successfully" << std::endl;
+        // Setup bus
+        bus = gst_element_get_bus(pipeline);
+        
         return true;
+    }
+    
+    // Ultra high-performance callback - minimal processing
+    static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
+        VideoStreamer *streamer = static_cast<VideoStreamer*>(user_data);
+        
+        GstSample *sample = gst_app_sink_pull_sample(sink);
+        if (!sample) {
+            return GST_FLOW_ERROR;
+        }
+        
+        GstBuffer *buffer = gst_sample_get_buffer(sample);
+        if (!buffer) {
+            gst_sample_unref(sample);
+            return GST_FLOW_ERROR;
+        }
+        
+        // Create a reference to the buffer (avoid copying)
+        GstBuffer *buffer_ref = gst_buffer_ref(buffer);
+        
+        // Fast, non-blocking queue operation
+        bool queued = false;
+        {
+            std::unique_lock<std::mutex> lock(streamer->queue_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                // Drop frames if queue is full to maintain real-time performance
+                while (streamer->buffer_queue.size() >= MAX_QUEUE_SIZE) {
+                    GstBuffer *old_buffer = streamer->buffer_queue.front();
+                    streamer->buffer_queue.pop();
+                    gst_buffer_unref(old_buffer);
+                    streamer->frames_dropped++;
+                }
+                
+                streamer->buffer_queue.push(buffer_ref);
+                queued = true;
+            }
+        }
+        
+        if (queued) {
+            streamer->queue_cv.notify_one();
+            streamer->frames_processed++;
+        } else {
+            // Drop frame if we couldn't queue it
+            gst_buffer_unref(buffer_ref);
+            streamer->frames_dropped++;
+        }
+        
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+    
+    void processing_loop() {
+        GstClockTime base_time = GST_CLOCK_TIME_NONE;
+        GstClockTime frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, 60); // 60 fps
+        guint64 frame_count = 0;
+        
+        while (running) {
+            GstBuffer *buffer = nullptr;
+            
+            // Get buffer from queue with timeout
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                if (queue_cv.wait_for(lock, std::chrono::milliseconds(33), 
+                                     [this] { return !buffer_queue.empty() || !running; })) {
+                    if (!running) break;
+                    
+                    if (!buffer_queue.empty()) {
+                        buffer = buffer_queue.front();
+                        buffer_queue.pop();
+                    }
+                }
+            }
+            
+            if (buffer) {
+                // Set proper timestamps for constant frame rate
+                if (base_time == GST_CLOCK_TIME_NONE) {
+                    base_time = gst_element_get_base_time(pipeline);
+                    if (base_time == GST_CLOCK_TIME_NONE) {
+                        base_time = 0;
+                    }
+                }
+                
+                GstClockTime pts = base_time + frame_count * frame_duration;
+                GstClockTime dts = pts;
+                
+                GST_BUFFER_PTS(buffer) = pts;
+                GST_BUFFER_DTS(buffer) = dts;
+                GST_BUFFER_DURATION(buffer) = frame_duration;
+                
+                // Push buffer to appsrc with error handling
+                GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(app_src), buffer);
+                if (ret != GST_FLOW_OK) {
+                    if (ret == GST_FLOW_FLUSHING) {
+                        // Normal during shutdown
+                        break;
+                    } else {
+                        std::cerr << "Failed to push buffer to appsrc: " << gst_flow_get_name(ret) << std::endl;
+                    }
+                }
+                
+                frame_count++;
+            } else {
+                // Timeout occurred, check if we should continue
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        
+        // Signal EOS to appsrc
+        gst_app_src_end_of_stream(GST_APP_SRC(app_src));
+        
+        std::cout << "Processing loop ended. Total frames: " << frame_count << std::endl;
     }
     
     bool start() {
@@ -87,287 +292,193 @@ public:
             return false;
         }
         
-        // Start pipeline
-        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        running = true;
+        start_time = std::chrono::steady_clock::now();
+        frames_processed = 0;
+        frames_dropped = 0;
+        
+        // Start processing thread with high priority
+        processing_thread = std::thread(&VideoStreamer::processing_loop, this);
+        
+        // Set thread priority (requires root or CAP_SYS_NICE)
+        pthread_t native_handle = processing_thread.native_handle();
+        struct sched_param param;
+        param.sched_priority = 10;
+        pthread_setschedparam(native_handle, SCHED_FIFO, &param);
+        
+        // Set pipeline to playing state
+        std::cout << "Setting pipeline to READY state..." << std::endl;
+        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_READY);
         if (ret == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start pipeline" << std::endl;
+            std::cerr << "Failed to set pipeline to ready state" << std::endl;
+            running = false;
             return false;
         }
         
-        running = true;
+        std::cout << "Setting pipeline to PLAYING state..." << std::endl;
+        ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "Failed to set pipeline to playing state" << std::endl;
+            running = false;
+            return false;
+        }
         
-        // Start bus monitoring thread
-        bus_thread = std::thread([this]() {
-            g_main_loop_run(main_loop);
-        });
+        // Wait for pipeline to reach playing state
+        GstState state;
+        ret = gst_element_get_state(pipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
+        if (ret != GST_STATE_CHANGE_SUCCESS || state != GST_STATE_PLAYING) {
+            std::cerr << "Pipeline failed to reach playing state" << std::endl;
+            running = false;
+            return false;
+        }
         
-        std::cout << "Video streaming started" << std::endl;
-        std::cout << "Streaming to UDP: 192.168.25.69:5004" << std::endl;
-        std::cout << "Press Ctrl+C to stop..." << std::endl;
+        std::cout << "Video streaming started successfully!" << std::endl;
+        std::cout << "Capturing 1920x1080@60fps NV12 -> H.264 @ " << TARGET_BITRATE/1000000 << "Mbps -> UDP 192.168.25.69:5004" << std::endl;
+        
+        // Create main loop
+        loop = g_main_loop_new(nullptr, FALSE);
         
         return true;
+    }
+    
+    void run() {
+        if (!loop) return;
+        
+        // Start performance monitoring thread
+        std::thread monitor_thread([this]() {
+            while (running) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (running) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                    if (duration > 0) {
+                        double fps_processed = static_cast<double>(frames_processed) / duration;
+                        double drop_rate = static_cast<double>(frames_dropped) * 100.0 / 
+                                         (frames_processed + frames_dropped + 0.001);
+                        
+                        std::cout << "Performance: " << fps_processed << " fps processed, "
+                                  << "Queue size: " << buffer_queue.size() 
+                                  << ", Drop rate: " << drop_rate << "%" << std::endl;
+                    }
+                }
+            }
+        });
+        
+        // Handle bus messages
+        std::thread bus_thread([this]() {
+            while (running) {
+                GstMessage *msg = gst_bus_timed_pop_filtered(bus, 100 * GST_MSECOND,
+                    static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS | 
+                                              GST_MESSAGE_WARNING | GST_MESSAGE_STATE_CHANGED));
+                
+                if (msg) {
+                    handle_message(msg);
+                    gst_message_unref(msg);
+                }
+            }
+        });
+        
+        // Run main loop
+        g_main_loop_run(loop);
+        
+        // Cleanup threads
+        if (monitor_thread.joinable()) {
+            monitor_thread.join();
+        }
+        if (bus_thread.joinable()) {
+            bus_thread.join();
+        }
     }
     
     void stop() {
         if (!running) return;
         
+        std::cout << "Stopping video streamer..." << std::endl;
         running = false;
         
         // Stop pipeline
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        
-        // Stop main loop
-        if (main_loop) {
-            g_main_loop_quit(main_loop);
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
         }
         
-        // Wait for bus thread
-        if (bus_thread.joinable()) {
-            bus_thread.join();
+        // Wake up processing thread
+        queue_cv.notify_all();
+        
+        if (processing_thread.joinable()) {
+            processing_thread.join();
         }
         
-        std::cout << "Video streaming stopped" << std::endl;
+        if (loop) {
+            g_main_loop_quit(loop);
+        }
+        
+        // Clear remaining buffers in queue
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        while (!buffer_queue.empty()) {
+            gst_buffer_unref(buffer_queue.front());
+            buffer_queue.pop();
+        }
+        
+        // Print final statistics
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_time).count();
+        if (duration > 0) {
+            double avg_fps = static_cast<double>(frames_processed) / duration;
+            double total_drop_rate = static_cast<double>(frames_dropped) * 100.0 / 
+                                   (frames_processed + frames_dropped + 0.001);
+            std::cout << "Final stats: " << avg_fps << " fps average, " 
+                      << total_drop_rate << "% frames dropped" << std::endl;
+        }
     }
     
 private:
-    bool createElement() {
-        // Camera source - using v4l2src for Linux camera capture
-        camera_src = gst_element_factory_make("v4l2src", "camera-src");
-        if (!camera_src) {
-            std::cerr << "Failed to create v4l2src element" << std::endl;
-            return false;
-        }
-        
-        // Camera caps filter
-        camera_caps = gst_element_factory_make("capsfilter", "camera-caps");
-        
-        // App elements
-        appsink = gst_element_factory_make("appsink", "app-sink");
-        appsrc = gst_element_factory_make("appsrc", "app-src");
-        
-        // Encoder - using omxh264enc on ZCU106 board
-        encoder = gst_element_factory_make("omxh264enc", "encoder");
-        if (!encoder) {
-            std::cerr << "Failed to create omxh264enc encoder" << std::endl;
-            return false;
-        }
-        
-        // Encoder caps filter
-        encoder_caps = gst_element_factory_make("capsfilter", "encoder-caps");
-        
-        // RTP payloader
-        rtp_payloader = gst_element_factory_make("rtph264pay", "rtp-pay");
-        
-        // UDP sink
-        udp_sink = gst_element_factory_make("udpsink", "udp-sink");
-        
-        if (!camera_caps || !appsink || !appsrc || !encoder_caps || !rtp_payloader || !udp_sink) {
-            std::cerr << "Failed to create one or more elements" << std::endl;
-            return false;
-        }
-        
-        return true;
-    }
-    
-    bool setElementProperties() {
-        // Camera source properties
-        g_object_set(camera_src, "device", "/dev/video0", nullptr);
-        
-        // Camera caps - capture at 1920x1080@60fps NV12
-        GstCaps *camera_caps_filter = gst_caps_new_simple("video/x-raw",
-            "format", G_TYPE_STRING, "NV12",
-            "width", G_TYPE_INT, 1920,
-            "height", G_TYPE_INT, 1080,
-            "framerate", GST_TYPE_FRACTION, 60, 1,
-            nullptr);
-        g_object_set(camera_caps, "caps", camera_caps_filter, nullptr);
-        gst_caps_unref(camera_caps_filter);
-        
-        // Appsink properties for optimal performance
-        g_object_set(appsink,
-            "emit-signals", TRUE,
-            "sync", FALSE,
-            "max-buffers", 2,  // Keep buffer count low to reduce latency
-            "drop", TRUE,      // Drop buffers if downstream is slow
-            nullptr);
-        
-        // Appsrc properties
-        g_object_set(appsrc,
-            "caps", gst_caps_new_simple("video/x-raw",
-                "format", G_TYPE_STRING, "NV12",
-                "width", G_TYPE_INT, 1920,
-                "height", G_TYPE_INT, 1080,
-                "framerate", GST_TYPE_FRACTION, 60, 1,
-                nullptr),
-            "format", GST_FORMAT_TIME,
-            "is-live", TRUE,
-            "do-timestamp", TRUE,
-            "max-bytes", 0,    // No limit on bytes
-            "block", FALSE,    // Non-blocking mode
-            nullptr);
-        
-        // Encoder properties for omxh264enc on ZCU106
-        g_object_set(encoder,
-            "target-bitrate", 10000,      // 8 Mbps
-            "control-rate", 2,       // Variable bitrate
-            "preset-level", 2,       // High performance preset
-            nullptr);
-        
-        // Encoder caps
-        GstCaps *encoder_caps_filter = gst_caps_new_simple("video/x-h264",
-            "profile", G_TYPE_STRING, "high",
-            "level", G_TYPE_STRING, "4.0",
-            nullptr);
-        g_object_set(encoder_caps, "caps", encoder_caps_filter, nullptr);
-        gst_caps_unref(encoder_caps_filter);
-        
-        // RTP payloader properties
-        g_object_set(rtp_payloader,
-            "config-interval", 1,        // Send SPS/PPS every second
-            "pt", 96,                    // Payload type
-            nullptr);
-        
-        // UDP sink properties
-        g_object_set(udp_sink,
-            "clients", "192.168.25.69:5004",
-            "sync", FALSE,
-            "async", FALSE,
-            nullptr);
-        
-        return true;
-    }
-    
-    bool linkElements() {
-        // Link camera source chain
-        if (!gst_element_link_many(camera_src, camera_caps, appsink, nullptr)) {
-            std::cerr << "Failed to link camera source elements" << std::endl;
-            return false;
-        }
-        
-        // Link encoder chain
-        if (!gst_element_link_many(appsrc, encoder, encoder_caps, rtp_payloader, udp_sink, nullptr)) {
-            std::cerr << "Failed to link encoder elements" << std::endl;
-            return false;
-        }
-        
-        return true;
-    }
-    
-    void setupCallbacks() {
-        // Set up appsink callback for high performance
-        GstAppSinkCallbacks callbacks = {};
-        callbacks.new_sample = onNewSample;
-        callbacks.eos = onEOS;
-        
-        gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &callbacks, this, nullptr);
-    }
-    
-    void setupBus() {
-        bus = gst_element_get_bus(pipeline);
-        gst_bus_add_watch(bus, busCallback, this);
-    }
-    
-    // High-performance callback function
-    static GstFlowReturn onNewSample(GstAppSink *sink, gpointer user_data) {
-        VideoStreamer *self = static_cast<VideoStreamer*>(user_data);
-        return self->processNewSample(sink);
-    }
-    
-    GstFlowReturn processNewSample(GstAppSink *sink) {
-        // Pull sample from appsink
-        GstSample *sample = gst_app_sink_pull_sample(sink);
-        if (!sample) {
-            return GST_FLOW_ERROR;
-        }
-        
-        // Get buffer from sample
-        GstBuffer *buffer = gst_sample_get_buffer(sample);
-        if (!buffer) {
-            gst_sample_unref(sample);
-            return GST_FLOW_ERROR;
-        }
-        
-        // Create a copy of the buffer for appsrc (to avoid conflicts)
-        GstBuffer *buffer_copy = gst_buffer_copy(buffer);
-        
-        // Push buffer to appsrc
-        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer_copy);
-        
-        // Cleanup
-        gst_sample_unref(sample);
-        
-        // Handle flow return
-        if (ret != GST_FLOW_OK) {
-            if (ret == GST_FLOW_FLUSHING) {
-                // Pipeline is shutting down, this is normal
-                return GST_FLOW_OK;
-            }
-            std::cerr << "Error pushing buffer to appsrc: " << ret << std::endl;
-            return ret;
-        }
-        
-        return GST_FLOW_OK;
-    }
-    
-    static void onEOS(GstAppSink *sink, gpointer user_data) {
-        VideoStreamer *self = static_cast<VideoStreamer*>(user_data);
-        std::cout << "EOS received from appsink" << std::endl;
-        
-        // Send EOS to appsrc
-        gst_app_src_end_of_stream(GST_APP_SRC(self->appsrc));
-    }
-    
-    static gboolean busCallback(GstBus *bus, GstMessage *message, gpointer user_data) {
-        VideoStreamer *self = static_cast<VideoStreamer*>(user_data);
-        return self->processBusMessage(message);
-    }
-    
-    gboolean processBusMessage(GstMessage *message) {
-        switch (GST_MESSAGE_TYPE(message)) {
+    void handle_message(GstMessage *msg) {
+        switch (GST_MESSAGE_TYPE(msg)) {
             case GST_MESSAGE_ERROR: {
-                GError *error;
-                gchar *debug;
-                gst_message_parse_error(message, &error, &debug);
-                std::cerr << "Error: " << error->message << std::endl;
-                std::cerr << "Debug: " << debug << std::endl;
-                g_error_free(error);
-                g_free(debug);
-                g_main_loop_quit(main_loop);
+                GError *err;
+                gchar *debug_info;
+                gst_message_parse_error(msg, &err, &debug_info);
+                std::cerr << "Error from " << GST_OBJECT_NAME(msg->src) << ": " << err->message << std::endl;
+                if (debug_info) {
+                    std::cerr << "Debug info: " << debug_info << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug_info);
+                stop();
                 break;
             }
             case GST_MESSAGE_EOS:
                 std::cout << "End of stream" << std::endl;
-                g_main_loop_quit(main_loop);
+                stop();
                 break;
-            case GST_MESSAGE_STATE_CHANGED: {
-                if (GST_MESSAGE_SRC(message) == GST_OBJECT(pipeline)) {
-                    GstState old_state, new_state;
-                    gst_message_parse_state_changed(message, &old_state, &new_state, nullptr);
-                    std::cout << "Pipeline state changed from " 
-                              << gst_element_state_get_name(old_state) 
-                              << " to " << gst_element_state_get_name(new_state) << std::endl;
+            case GST_MESSAGE_WARNING: {
+                GError *err;
+                gchar *debug_info;
+                gst_message_parse_warning(msg, &err, &debug_info);
+                std::cout << "Warning from " << GST_OBJECT_NAME(msg->src) << ": " << err->message << std::endl;
+                if (debug_info) {
+                    std::cout << "Debug info: " << debug_info << std::endl;
                 }
+                g_error_free(err);
+                g_free(debug_info);
                 break;
             }
-            case GST_MESSAGE_WARNING: {
-                GError *error;
-                gchar *debug;
-                gst_message_parse_warning(message, &error, &debug);
-                std::cerr << "Warning: " << error->message << std::endl;
-                g_error_free(error);
-                g_free(debug);
+            case GST_MESSAGE_STATE_CHANGED: {
+                if (GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline)) {
+                    GstState old_state, new_state, pending_state;
+                    gst_message_parse_state_changed(msg, &old_state, &new_state, &pending_state);
+                    std::cout << "Pipeline state changed from " << gst_element_state_get_name(old_state)
+                              << " to " << gst_element_state_get_name(new_state) << std::endl;
+                }
                 break;
             }
             default:
                 break;
         }
-        return TRUE;
     }
     
     void cleanup() {
-        if (running) {
-            stop();
-        }
+        stop();
         
         if (bus) {
             gst_object_unref(bus);
@@ -379,28 +490,32 @@ private:
             pipeline = nullptr;
         }
         
-        if (main_loop) {
-            g_main_loop_unref(main_loop);
-            main_loop = nullptr;
+        if (loop) {
+            g_main_loop_unref(loop);
+            loop = nullptr;
         }
-        
-        gst_deinit();
     }
 };
 
 // Signal handler for graceful shutdown
 VideoStreamer *g_streamer = nullptr;
-void signalHandler(int signal) {
-    std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
+
+void signal_handler(int signal) {
+    std::cout << "\nReceived signal " << signal << ", shutting down gracefully..." << std::endl;
     if (g_streamer) {
         g_streamer->stop();
     }
 }
 
-int main() {
-    // Set up signal handler
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+int main(int argc, char *argv[]) {
+    // Install signal handler
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    std::cout << "GStreamer High-Performance Video Streamer" << std::endl;
+    std::cout << "Optimized for 1920x1080@60fps NV12 -> H.264 @ 10Mbps" << std::endl;
+    std::cout << "Based on working pipeline configuration" << std::endl;
+    std::cout << "Streaming to 192.168.25.69:5004" << std::endl;
     
     VideoStreamer streamer;
     g_streamer = &streamer;
@@ -411,14 +526,12 @@ int main() {
     }
     
     if (!streamer.start()) {
-        std::cerr << "Failed to start video streaming" << std::endl;
+        std::cerr << "Failed to start video streamer" << std::endl;
         return -1;
     }
     
-    // Keep main thread alive
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
+    streamer.run();
     
+    std::cout << "Video streamer stopped" << std::endl;
     return 0;
 }
