@@ -1,179 +1,145 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
+#include <iostream>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
 
-std::mutex buffer_mutex;
-std::condition_variable buffer_cond;
-GstBuffer* global_buffer = nullptr;
-std::atomic<bool> new_buffer_available{false};
-std::atomic<bool> running{true};
+// Global pointers
+GstElement *pipeline = nullptr;
+GstElement *appsrc = nullptr;
+GstElement *appsink = nullptr;
 
-// Callback: appsink receives a buffer
-GstFlowReturn on_new_sample_from_sink(GstElement* sink, void* user_data) {
-    GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-    GstBuffer* buffer = gst_sample_get_buffer(sample);
+std::atomic<bool> running(true);
 
-    // Deep copy the buffer (appsink may reuse it)
-    GstBuffer* buffer_copy = gst_buffer_copy(buffer);
+// Callback function: called when appsink receives a buffer
+static GstFlowReturn on_new_sample_from_sink(GstElement *sink, void *user_data) {
+    // Extract sample from appsink
+    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+    if (!sample) return GST_FLOW_ERROR;
 
-    // Wait for previous buffer to be consumed
-    std::unique_lock<std::mutex> lock(buffer_mutex);
-    buffer_cond.wait(lock, [] { return !new_buffer_available || !running; });
-    
-    if (!running) {
-        lock.unlock();
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    if (!buffer) {
         gst_sample_unref(sample);
-        gst_buffer_unref(buffer_copy);
-        return GST_FLOW_EOS;
+        return GST_FLOW_ERROR;
     }
 
-    // Set new buffer
-    if (global_buffer) {
-        gst_buffer_unref(global_buffer);
+    // Get caps from sample (important for format info)
+    GstCaps *caps = gst_sample_get_caps(sample);
+    if (!caps) {
+        gst_sample_unref(sample);
+        return GST_FLOW_ERROR;
     }
-    global_buffer = buffer_copy;
-    new_buffer_available = true;
-    lock.unlock();
 
-    // Notify appsrc thread
-    buffer_cond.notify_one();
+    // Push buffer to appsrc
+    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gst_buffer_copy(buffer));
 
+    // Unref the sample (not the buffer if copied)
     gst_sample_unref(sample);
-    return GST_FLOW_OK;
+
+    return ret;
 }
 
-// Thread function: appsrc pushes buffers
-void appsrc_thread(GstElement* appsrc) {
-    while (running) {
-        std::unique_lock<std::mutex> lock(buffer_mutex);
-
-        // Wait for a new buffer
-        buffer_cond.wait(lock, [] { return new_buffer_available.load() || !running.load(); });
-
-        if (!running) break;
-
-        if (global_buffer) {
-            GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gst_buffer_ref(global_buffer));
-            if (ret != GST_FLOW_OK) {
-                g_print("appsrc push failed: %s\n", gst_flow_get_name(ret));
-            }
-
-            // Clean up
-            gst_buffer_unref(global_buffer);
-            global_buffer = nullptr;
-            new_buffer_available = false;
-
-            lock.unlock();
-            // Notify sink that buffer is consumed
-            buffer_cond.notify_one();
-        } else {
-            lock.unlock();
-        }
-    }
-}
-
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
     // Initialize GStreamer
     gst_init(&argc, &argv);
 
-    GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
-
     // Create pipeline
-    GstElement* pipeline = gst_pipeline_new("camera-stream-pipeline");
+    pipeline = gst_pipeline_new("video-pipeline");
+    if (!pipeline) {
+        std::cerr << "Failed to create pipeline" << std::endl;
+        return -1;
+    }
 
     // Create elements
-    GstElement* v4l2src = gst_element_factory_make("v4l2src", "v4l2-source");
-    g_object_set(v4l2src, "device", "/dev/video0", "io-mode", 4, nullptr);
+    GstElement *source = gst_element_factory_make("v4l2src", "source");
+    GstElement *capsfilter_in = gst_element_factory_make("capsfilter", "capsfilter_in");
+    GstElement *videoscale = gst_element_factory_make("videoscale", "videoscale");
+    GstElement *capsfilter_out = gst_element_factory_make("capsfilter", "capsfilter_out");
+    appsink = gst_element_factory_make("appsink", "appsink");
+    appsrc = gst_element_factory_make("appsrc", "appsrc");
+    GstElement *encoder = gst_element_factory_make("omxh264enc", "encoder");  // Use nvv4l2h264enc on Jetson if needed
+    GstElement *rtppay = gst_element_factory_make("rtph264pay", "rtppay");
+    GstElement *udpsink = gst_element_factory_make("udpsink", "udpsink");
 
-    GstElement* capsfilter_src = gst_element_factory_make("capsfilter", "src-caps");
-    GstCaps* src_caps = gst_caps_from_string("video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1");
-    g_object_set(capsfilter_src, "caps", src_caps, nullptr);
-    gst_caps_unref(src_caps);
+    if (!source || !capsfilter_in || !videoscale || !capsfilter_out ||
+        !appsink || !appsrc || !encoder || !rtppay || !udpsink) {
+        std::cerr << "Failed to create one or more elements" << std::endl;
+        gst_object_unref(pipeline);
+        return -1;
+    }
 
-    GstElement* appsink = gst_element_factory_make("appsink", "sink");
-    GstCaps* sink_caps = gst_caps_from_string("video/x-raw,format=NV12");
-    g_object_set(appsink, "caps", sink_caps, "emit-signals", TRUE, "sync", FALSE, nullptr);
+    // Set source capabilities (assume camera outputs 4K NV12 @60fps)
+    GstCaps *input_caps = gst_caps_from_string(
+        "video/x-raw,format=NV12,width=3840,height=2160,framerate=60/1"
+    );
+    g_object_set(capsfilter_in, "caps", input_caps, nullptr);
+    gst_caps_unref(input_caps);
+
+    // Set output resolution: 1920x1080 NV12 @60fps
+    GstCaps *output_caps = gst_caps_from_string(
+        "video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1"
+    );
+    g_object_set(capsfilter_out, "caps", output_caps, nullptr);
+    gst_caps_unref(output_caps);
+
+    // Configure appsink
+    g_object_set(appsink, "emit-signals", TRUE, nullptr);
+    g_object_set(appsink, "sync", FALSE, nullptr);  // Avoid clock blocking
+    g_object_set(appsink, "max-buffers", 4, nullptr);  // Limit queue size
+    g_object_set(appsink, "drop", TRUE, nullptr);  // Drop old buffers under load
     g_signal_connect(appsink, "new-sample", G_CALLBACK(on_new_sample_from_sink), nullptr);
-    gst_caps_unref(sink_caps);
 
-    GstElement* appsrc = gst_element_factory_make("appsrc", "source");
-    GstCaps* appsrc_caps = gst_caps_from_string("video/x-raw,format=NV12,width=1920,height=1080,framerate=60/1");
-    g_object_set(appsrc, "caps", appsrc_caps, "format", GST_FORMAT_TIME, "is-live", TRUE, "do-timestamp", TRUE, nullptr);
-    gst_caps_unref(appsrc_caps);
+    // Configure appsrc
+    g_object_set(appsrc, "caps", output_caps, nullptr);
+    g_object_set(appsrc, "format", GST_FORMAT_TIME, nullptr);
+    g_object_set(appsrc, "is-live", TRUE, nullptr);
+    g_object_set(appsrc, "do-timestamp", TRUE, nullptr);
 
-    GstElement* encoder = gst_element_factory_make("omxh265enc", "h265-encoder");
-    g_object_set(encoder,
-        "num-slices", 8,
-        "periodicity-idr", 240,
-        "cpb-size", 500,
-        "gdr-mode", 2, // horizontal
-        "initial-delay", 250,
-        "control-rate", 2, // low-latency
-        "prefetch-buffer", TRUE,
-        "target-bitrate", 8000000, // 8 Mbps
-        "gop-mode", 1, // low-delay-p
-        nullptr);
+    // Set UDP destination
+    g_object_set(udpsink, "host", "192.168.25.69", "port", 5004, nullptr);
+    g_object_set(udpsink, "async", FALSE, "sync", FALSE, nullptr);  // Avoid blocking on clock
 
-    GstElement* rtppay = gst_element_factory_make("rtph265pay", "rtp-pay");
-    g_object_set(rtppay, "config-interval", 1, "mtu", 1400, nullptr);
-
-    GstElement* udpsink = gst_element_factory_make("udpsink", "udp-sink");
-    g_object_set(udpsink,
-        "host", "192.168.25.69",
-        "port", 5004,
-        "buffer-size", 60000000,
-        "async", FALSE,
-        "max-lateness", -1,
-        "qos-dscp", 60,
-        nullptr);
+    // Optional: tune encoder
+    g_object_set(encoder, "control-rate", 1, "target-bitrate", 10000, nullptr);  // VBR, 10 Mbps
 
     // Build pipeline
     gst_bin_add_many(GST_BIN(pipeline),
-        v4l2src, capsfilter_src, appsink,
-        appsrc, encoder, rtppay, udpsink, nullptr);
+                     source, capsfilter_in, videoscale, capsfilter_out,
+                     appsink, appsrc, encoder, rtppay, udpsink, nullptr);
 
-    // Link: v4l2src → capsfilter → appsink
-    if (!gst_element_link_many(v4l2src, capsfilter_src, appsink, nullptr)) {
-        g_printerr("Failed to link v4l2src → appsink\n");
+    // Link elements
+    if (!gst_element_link_many(source, capsfilter_in, videoscale, capsfilter_out, appsink, nullptr)) {
+        std::cerr << "Failed to link source -> appsink part" << std::endl;
+        gst_object_unref(pipeline);
         return -1;
     }
 
-    // Link: appsrc → encoder → rtph265pay → udpsink
     if (!gst_element_link_many(appsrc, encoder, rtppay, udpsink, nullptr)) {
-        g_printerr("Failed to link appsrc → udpsink\n");
+        std::cerr << "Failed to link appsrc -> udpsink part" << std::endl;
+        gst_object_unref(pipeline);
         return -1;
     }
 
-    // Start the appsrc thread
-    std::thread src_thread(appsrc_thread, appsrc);
+    // Start pipeline
+    GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "Failed to start pipeline" << std::endl;
+        gst_object_unref(pipeline);
+        return -1;
+    }
 
-    // Set pipeline to PLAYING
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    std::cout << "Pipeline running... Streaming 1920x1080@60fps NV12 via UDP to 192.168.25.69:5004\n";
+    std::cout << "Press Ctrl+C to stop." << std::endl;
 
-    g_print("Pipeline running...\n");
-
-    // Run main loop
-    g_main_loop_run(loop);
+    // Run main loop (minimal)
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     // Cleanup
-    running = false;
-    buffer_cond.notify_all();
-    if (src_thread.joinable()) {
-        src_thread.join();
-    }
-
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
-    g_main_loop_unref(loop);
-
-    if (global_buffer) {
-        gst_buffer_unref(global_buffer);
-        global_buffer = nullptr;
-    }
 
     return 0;
 }
