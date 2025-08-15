@@ -1,8 +1,9 @@
-// histequalize_host.c — appsink->appsrc bridge with resolution/fps fully parameterized
+// histequalize_host.c — appsink->appsrc bridge tuned for 1080p60, DMABuf AUTO/ON/OFF + memory logs
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/video/video.h>
+#include <gst/allocators/gstdmabuf.h>
 #include <glib.h>
 #include <string.h>
 #include <stdlib.h>
@@ -16,11 +17,19 @@ typedef struct {
     GMainLoop    *loop;
 } CustomData;
 
+typedef enum { DMABUF_AUTO, DMABUF_ON, DMABUF_OFF } DmaBufMode;
+
 static volatile sig_atomic_t g_stop = 0;
-static guint64 g_callback_frames = 0;
-static guint64 g_encoder_frames = 0;
+static guint64 g_callback_frames = 0;   // pulled from appsink
+static guint64 g_pushed_ok = 0;         // successful appsrc pushes
+static guint64 g_appsrc_out = 0;        // buffers leaving appsrc (src pad)
+static guint64 g_encoder_frames = 0;    // buffers arriving at encoder sink
 static GTimer *g_timer = NULL;
 static GMutex g_stats_mutex;
+
+// one-shot memory logs
+static gboolean g_logged_in_mem  = FALSE;
+static gboolean g_logged_out_mem = FALSE;
 
 static void handle_sigint(int signum) { (void)signum; g_stop = 1; }
 
@@ -54,25 +63,38 @@ static gboolean on_bus_message(GstBus *bus, GstMessage *msg, gpointer user_data)
     return TRUE;
 }
 
+static gboolean buffer_has_dmabuf(GstBuffer *buf) {
+    if (!buf) return FALSE;
+    guint n = gst_buffer_n_memory(buf);
+    for (guint i=0; i<n; ++i) {
+        GstMemory *m = gst_buffer_peek_memory(buf, i);
+        if (m && gst_is_dmabuf_memory(m)) return TRUE;
+    }
+    return FALSE;
+}
+
 static GstPadProbeReturn enc_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
     static guint64 cnt = 0;
     static GstClockTime first_pts = GST_CLOCK_TIME_NONE;
     static GstClockTime last_report_time = 0;
+    static gboolean logged_enc_mem = FALSE; // log once
     (void)pad; (void)user_data;
 
     if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
         GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
         if (buf) {
+            if (!logged_enc_mem) {
+                g_print("[MEM] enc-sink: DMABuf=%s\n", buffer_has_dmabuf(buf) ? "YES" : "NO");
+                logged_enc_mem = TRUE;
+            }
+
             cnt++;
             g_mutex_lock(&g_stats_mutex);
             g_encoder_frames++;
             g_mutex_unlock(&g_stats_mutex);
 
             GstClockTime pts = GST_BUFFER_PTS(buf);
-            if (first_pts == GST_CLOCK_TIME_NONE) {
-                first_pts = pts;
-                last_report_time = pts;
-            }
+            if (first_pts == GST_CLOCK_TIME_NONE) { first_pts = pts; last_report_time = pts; }
             if (pts != GST_CLOCK_TIME_NONE && pts - last_report_time >= 2 * GST_SECOND) {
                 gdouble elapsed_sec = (gdouble)(pts - first_pts) / GST_SECOND;
                 gdouble actual_fps = elapsed_sec > 0 ? (gdouble)cnt / elapsed_sec : 0;
@@ -90,6 +112,21 @@ static GstPadProbeReturn enc_sink_probe(GstPad *pad, GstPadProbeInfo *info, gpoi
                 last_report_time = pts;
             }
         }
+    }
+    return GST_PAD_PROBE_PASS;
+}
+
+static GstPadProbeReturn appsrc_src_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void)pad; (void)user_data;
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+        if (!g_logged_out_mem) {
+            g_print("[MEM] appsrc-out: DMABuf=%s\n", buffer_has_dmabuf(buf) ? "YES" : "NO");
+            g_logged_out_mem = TRUE;
+        }
+        g_mutex_lock(&g_stats_mutex);
+        g_appsrc_out++;
+        g_mutex_unlock(&g_stats_mutex);
     }
     return GST_PAD_PROBE_PASS;
 }
@@ -117,19 +154,28 @@ static GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
         }
     }
 
+    if (!g_logged_in_mem) {
+        g_print("[MEM] appsink: DMABuf=%s\n", buffer_has_dmabuf(buffer) ? "YES" : "NO");
+        g_logged_in_mem = TRUE;
+    }
+
     g_mutex_lock(&g_stats_mutex);
     g_callback_frames++;
     g_mutex_unlock(&g_stats_mutex);
 
-    // Push a ref of the same buffer downstream.
     GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(data->appsrc), gst_buffer_ref(buffer));
+    if (ret == GST_FLOW_OK) {
+        g_mutex_lock(&g_stats_mutex);
+        g_pushed_ok++;
+        g_mutex_unlock(&g_stats_mutex);
+    }
     gst_sample_unref(sample);
     return ret;
 }
 
 static gboolean print_stats_timeout(gpointer user_data) {
     (void)user_data;
-    static guint64 last_callback = 0, last_encoder = 0;
+    static guint64 last_callback = 0, last_encoder = 0, last_pushok = 0, last_appsrc_out = 0;
     static gdouble last_time = 0;
 
     if (!g_timer) return TRUE;
@@ -138,27 +184,35 @@ static gboolean print_stats_timeout(gpointer user_data) {
 
     g_mutex_lock(&g_stats_mutex);
     guint64 current_callback = g_callback_frames;
-    guint64 current_encoder = g_encoder_frames;
+    guint64 current_encoder  = g_encoder_frames;
+    guint64 current_pushok   = g_pushed_ok;
+    guint64 current_appsrc_o = g_appsrc_out;
     g_mutex_unlock(&g_stats_mutex);
 
     if (last_time > 0) {
         gdouble time_diff = current_time - last_time;
         if (time_diff >= 1.0) {
             gdouble callback_fps = (current_callback - last_callback) / time_diff;
-            gdouble encoder_fps = (current_encoder - last_encoder) / time_diff;
+            gdouble pushok_fps   = (current_pushok   - last_pushok)   / time_diff;
+            gdouble appsrcout_fps= (current_appsrc_o - last_appsrc_out)/ time_diff;
+            gdouble encoder_fps  = (current_encoder  - last_encoder)  / time_diff;
 
-            g_print("[REALTIME] Callback: %.1f fps | Encoder: %.1f fps | Efficiency: %.1f%%\n",
-                    callback_fps, encoder_fps,
+            g_print("[REALTIME] cb %.1f | pushOK %.1f | appsrc-out %.1f | enc %.1f fps | eff(enc/cb)=%.0f%%\n",
+                    callback_fps, pushok_fps, appsrcout_fps, encoder_fps,
                     callback_fps > 0 ? (encoder_fps / callback_fps) * 100 : 0);
 
-            last_callback = current_callback;
-            last_encoder = current_encoder;
+            last_callback  = current_callback;
+            last_encoder   = current_encoder;
+            last_pushok    = current_pushok;
+            last_appsrc_out= current_appsrc_o;
             last_time = current_time;
         }
     } else {
         last_time = current_time;
-        last_callback = current_callback;
-        last_encoder = current_encoder;
+        last_callback  = current_callback;
+        last_encoder   = current_encoder;
+        last_pushok    = current_pushok;
+        last_appsrc_out= current_appsrc_o;
     }
     return TRUE;
 }
@@ -169,13 +223,14 @@ int main(int argc, char *argv[]) {
 
     // ---- CLI ----
     gint bitrate_kbps = 10000;
-    gint fps          = 60;
+    gint fps          = 60;          // focus on 1080p60
     gint width        = 1920;
     gint height       = 1080;
     const gchar *device   = "/dev/video0";
     const gchar *dst_host = "192.168.25.69";
     gint dst_port         = 5004;
     enum { CODEC_H264, CODEC_H265 } codec = CODEC_H264;
+    DmaBufMode dmabuf_mode = DMABUF_AUTO;
 
     for (int i = 1; i < argc; i++) {
         if (g_str_has_prefix(argv[i], "--bitrate="))       bitrate_kbps = atoi(argv[i] + 10);
@@ -189,29 +244,34 @@ int main(int argc, char *argv[]) {
             const char *c = argv[i] + 8;
             if (!g_ascii_strcasecmp(c, "h265") || !g_ascii_strcasecmp(c, "hevc")) codec = CODEC_H265;
             else codec = CODEC_H264;
+        } else if (g_str_has_prefix(argv[i], "--dmabuf=")) {
+            const char *v = argv[i] + 9;
+            if (!g_ascii_strcasecmp(v, "1") || !g_ascii_strcasecmp(v, "on")) dmabuf_mode = DMABUF_ON;
+            else if (!g_ascii_strcasecmp(v, "0") || !g_ascii_strcasecmp(v, "off")) dmabuf_mode = DMABUF_OFF;
+            else dmabuf_mode = DMABUF_AUTO;
         }
     }
 
-    // NV12 requires even width/height
     if ((width & 1) || (height & 1)) {
         g_printerr("Error: NV12 requires even width/height. Got %dx%d\n", width, height);
         return -1;
     }
 
-    g_print("Device=%s  %dx%d@%dfps  Bitrate=%dkbps  Codec=%s  dst=%s:%d\n",
+    g_print("Device=%s  %dx%d@%dfps  Bitrate=%dkbps  Codec=%s  dst=%s:%d  DMABuf=%s\n",
             device, width, height, fps, bitrate_kbps,
-            (codec==CODEC_H264?"H.264":"H.265"), dst_host, dst_port);
+            (codec==CODEC_H264?"H.264":"H.265"), dst_host, dst_port,
+            (dmabuf_mode==DMABUF_ON?"ON": dmabuf_mode==DMABUF_OFF?"OFF":"AUTO"));
 
     // ---- Pipelines ----
     CustomData data = {0};
 
-    // Capture/appsink: width/height/fps are now fully parameterized
+    // Capture/appsink: live mode, keep latency low and avoid backpressure at 60 fps
     gchar *sink_pipeline_str = g_strdup_printf(
         "v4l2src device=%s io-mode=dmabuf do-timestamp=true ! "
         "video/x-raw, format=NV12, width=%d, height=%d, framerate=%d/1, pixel-aspect-ratio=1/1 ! "
         "identity silent=false ! "
         "videorate drop-only=true max-rate=%d ! "
-        "appsink name=cv_sink emit-signals=true max-buffers=6 drop=false sync=false",
+        "appsink name=cv_sink emit-signals=true max-buffers=3 drop=true sync=false",
         device, width, height, fps, fps);
 
     GError *error = NULL;
@@ -229,39 +289,73 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // Encoder pipeline
+    // Encoder pipeline — leaky queues for low latency; udpsink sync=false
     gchar *src_pipeline_str = NULL;
-    int idr = fps * 4; if (idr < 60) idr = 60;
+    int idr = fps;                    // 1s IDR for quicker recovery
+    const char *queue_ll = "queue max-size-buffers=12 max-size-time=40000000 leaky=downstream";
+
+    // Build capsfilter string right after appsrc (DMABuf AUTO/ON/OFF)
+    gchar *caps_after_appsrc = NULL;
+    if (dmabuf_mode == DMABUF_ON) {
+        caps_after_appsrc = g_strdup_printf(
+            "video/x-raw(memory:DMABuf),format=NV12,width=%d,height=%d,framerate=%d/1",
+            width, height, fps);
+    } else if (dmabuf_mode == DMABUF_OFF) {
+        caps_after_appsrc = g_strdup_printf(
+            "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1",
+            width, height, fps);
+    } else { // AUTO: offer both, downstream will pick
+        caps_after_appsrc = g_strdup_printf(
+            "video/x-raw(memory:DMABuf),format=NV12,width=%d,height=%d,framerate=%d/1; "
+            "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1",
+            width, height, fps, width, height, fps);
+    }
 
     if (codec == CODEC_H264) {
+        // src_pipeline_str = g_strdup_printf(
+        //     "appsrc name=cv_src format=GST_FORMAT_TIME is-live=true do-timestamp=false ! "
+        //     "%s ! "                  // capsfilter immediately after appsrc
+        //     "%s ! "
+        //     "omxh264enc name=enc "
+        //     "control-rate=constant target-bitrate=%d "
+        //     "gop-mode=basic gop-length=%d periodicity-idr=%d "
+        //     "num-slices=2 prefetch-buffer=false ! "
+        //     "video/x-h264, alignment=au, stream-format=byte-stream ! "
+        //     "rtph264pay pt=96 mtu=1400 config-interval=1 ! "
+        //     "%s ! "
+        //     "udpsink host=%s port=%d sync=false",
+        //     caps_after_appsrc, queue_ll, bitrate_kbps, fps, idr, queue_ll, dst_host, dst_port);
         src_pipeline_str = g_strdup_printf(
-            "appsrc name=cv_src format=GST_FORMAT_TIME ! "
-            "video/x-raw, format=NV12, width=%d, height=%d, framerate=%d/1 ! "
-            "queue max-size-buffers=12 leaky=no ! "
-            "omxh264enc name=enc num-slices=8 periodicity-idr=%d "
-            "cpb-size=500 gdr-mode=horizontal initial-delay=250 "
-            "control-rate=low-latency prefetch-buffer=true "
-            "target-bitrate=%d gop-mode=low-delay-p ! "
-            "video/x-h264, alignment=nal, stream-format=byte-stream ! "
-            "rtph264pay pt=96 mtu=1400 config-interval=1 ! "
-            "queue max-size-buffers=12 leaky=no ! "
-            "udpsink host=%s port=%d sync=true",
-            width, height, fps, idr, bitrate_kbps, dst_host, dst_port);
+        "appsrc name=cv_src format=GST_FORMAT_TIME is-live=true do-timestamp=false ! "
+        "%s ! "                  /* capsfilter immediately after appsrc (DMABuf AUTO/ON/OFF) */
+        "%s ! "
+        "omxh264enc name=enc "
+        "control-rate=variable "          /* was: constant */
+        "target-bitrate=%d "
+        "gop-mode=low-delay-p gop-length=%d periodicity-idr=%d "
+        "num-slices=1 prefetch-buffer=false ! "
+        /* Request a high-profile bitstream; many encoders switch entropy/profile from this */
+        "video/x-h264,profile=high,alignment=au,stream-format=byte-stream ! "
+        "rtph264pay pt=96 mtu=1400 config-interval=1 ! "
+        "%s ! "
+        "udpsink host=%s port=%d sync=false",
+        caps_after_appsrc, queue_ll, bitrate_kbps, fps, fps, queue_ll, dst_host, dst_port);
     } else {
         src_pipeline_str = g_strdup_printf(
-            "appsrc name=cv_src format=GST_FORMAT_TIME ! "
-            "video/x-raw, format=NV12, width=%d, height=%d, framerate=%d/1 ! "
-            "queue max-size-buffers=12 leaky=no ! "
+            "appsrc name=cv_src format=GST_FORMAT_TIME is-live=true do-timestamp=false ! "
+            "%s ! "
+            "%s ! "
             "omxh265enc name=enc control-rate=constant target-bitrate=%d "
             "gop-mode=low-delay-p gop-length=%d periodicity-idr=%d "
-            "num-slices=8 qp-mode=auto prefetch-buffer=true "
-            "cpb-size=500 initial-delay=250 gdr-mode=horizontal filler-data=true ! "
+            "num-slices=2 qp-mode=auto prefetch-buffer=false "
+            "cpb-size=500 initial-delay=250 filler-data=false ! "
             "video/x-h265, alignment=au, profile=main, stream-format=byte-stream ! "
             "rtph265pay pt=96 mtu=1400 config-interval=1 ! "
-            "queue max-size-buffers=12 leaky=no ! "
-            "udpsink host=%s port=%d sync=true",
-            width, height, fps, bitrate_kbps, fps, idr, dst_host, dst_port);
+            "%s ! "
+            "udpsink host=%s port=%d sync=false",
+            caps_after_appsrc, queue_ll, bitrate_kbps, fps, idr, queue_ll, dst_host, dst_port);
     }
+    g_free(caps_after_appsrc);
 
     error = NULL;
     GstElement *app_src_pipeline = gst_parse_launch(src_pipeline_str, &error);
@@ -280,22 +374,13 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // appsrc configuration (note: no max-buffers property on appsrc)
+    // appsrc runtime config (preserve source PTS)
     g_object_set(data.appsrc,
                  "is-live", TRUE,
-                 "do-timestamp", TRUE,
+                 "do-timestamp", FALSE,
                  "block", TRUE,
                  "max-bytes", 8*1024*1024,
                  NULL);
-
-    // Explicit caps on appsrc
-    GstCaps *appsrc_caps = gst_caps_new_simple("video/x-raw",
-        "format",  G_TYPE_STRING, "NV12",
-        "width",   G_TYPE_INT,    width,
-        "height",  G_TYPE_INT,    height,
-        "framerate", GST_TYPE_FRACTION, fps, 1, NULL);
-    gst_app_src_set_caps(GST_APP_SRC(data.appsrc), appsrc_caps);
-    gst_caps_unref(appsrc_caps);
 
     // Bridge callback
     g_signal_connect(data.appsink, "new-sample", G_CALLBACK(new_sample_cb), &data);
@@ -328,6 +413,13 @@ int main(int argc, char *argv[]) {
             gst_object_unref(sinkpad);
         }
         gst_object_unref(enc);
+    }
+
+    // appsrc src-pad probe
+    GstPad *appsrc_srcpad = gst_element_get_static_pad(data.appsrc, "src");
+    if (appsrc_srcpad) {
+        gst_pad_add_probe(appsrc_srcpad, GST_PAD_PROBE_TYPE_BUFFER, appsrc_src_probe, NULL, NULL);
+        gst_object_unref(appsrc_srcpad);
     }
 
     // Start
