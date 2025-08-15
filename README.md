@@ -17,7 +17,7 @@ The pipeline is optimized for:
 - **OpenCV** fallback mode (CPU processing) for development/debugging
 - **GStreamer Appsink/Appsrc** integration
 - Support for **H.264** and **H.265** encoding via `omxh264enc` / `omxh265enc`
-- **Shortcutting Pipeline** approach (based on GStreamer Basic Tutorial 8) to minimize latency
+- **Short-cutting Pipeline** approach (based on GStreamer Basic Tutorial 8) to minimize latency
 - **Zero-copy** DMA buffer handling for efficient frame transfer
 - Real-time performance at:
   - **2K (1920×1080)** @ 30 FPS / 60 FPS
