@@ -115,7 +115,7 @@ int main(int argc, char *argv[]) {
     data.appsrc = gst_bin_get_by_name(GST_BIN(app_src_pipeline), "cv_src");
 
     // Link callback
-    g_signal_connect(data.appsink, "new-sample", G_CALLBACK(new_sample_cb), &data);
+    g_signal_connect(data.appsink, "new-sample", G_CALLBACK(new_sample_cb), &data); //trigger callback when new sample arrives
 
     // Start both pipelines
     gst_element_set_state(app_src_pipeline, GST_STATE_PLAYING);
