@@ -238,7 +238,7 @@ int main(int argc, char *argv[]) {
             "appsrc name=cv_src format=GST_FORMAT_TIME ! "
             "video/x-raw, format=NV12, width=%d, height=%d, framerate=%d/1 ! "
             "queue max-size-buffers=12 leaky=no ! "
-            "omxh264enc name=enc num-slices=8 qp-mode=auto periodicity-idr=%d "
+            "omxh264enc name=enc num-slices=8 periodicity-idr=%d "
             "cpb-size=500 gdr-mode=horizontal initial-delay=250 "
             "control-rate=low-latency prefetch-buffer=true "
             "target-bitrate=%d gop-mode=low-delay-p ! "
@@ -354,3 +354,6 @@ int main(int argc, char *argv[]) {
     gst_object_unref(app_src_pipeline);
     return 0;
 }
+
+
+Take a look at this program, analyze and then understand it

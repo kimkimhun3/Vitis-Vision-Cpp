@@ -138,19 +138,6 @@ const gchar *sink_pipeline_str =
     target_bitrate);
 
 
-    // pipeline_str = g_strdup_printf(
-    //     "appsrc name=cv_src format=GST_FORMAT_TIME ! "
-    //     "video/x-raw, format=NV12, width=1920, height=1080, framerate=%d/1 ! "
-    //     "queue ! "
-    //     "omxh264enc skip-frame=true max-consecutive-skip=5 gop-mode=low-delay-p target-bitrate=%d num-slices=8 control-rate=Constant qp-mode=auto "
-    //     "prefetch-buffer=true cpb-size=200 initial-delay=200 gdr-mode=horizontal "
-    //     "periodicity-idr=30 gop-length=30 filler-data=true ! "
-    //     "video/x-h264, alignment=au, profile=main, stream-format=byte-stream ! "
-    //     "rtph264pay mtu=1400 ! "
-    //     "queue max-size-buffers=2 ! "
-    //     "udpsink clients=192.168.25.69:5004 auto-multicast=false",
-    //     fps, bitrate);
-
 
     GstElement *src_pipeline = gst_parse_launch(src_pipeline_str, &error);
     g_free(src_pipeline_str);
