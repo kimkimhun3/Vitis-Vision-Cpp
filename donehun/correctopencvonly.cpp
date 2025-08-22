@@ -276,8 +276,8 @@ int main(int argc, char *argv[]) {
   // app sink pipeline with format specification (SAME AS ORIGINAL)
   gchar *pipeline_str =
       g_strdup_printf("v4l2src device=%s do-timestamp=false io-mode=4 ! "
-                      "video/x-raw, format=NV12, width=%d, height=%d, framerate=%s/1 ! "
-                      "videorate drop-only=true max-rate=60 ! appsink "
+                      "video/x-raw, format=NV12, width=%d, height=%d, framerate=60/1 ! "
+                      "videorate drop-only=true max-rate=%d ! appsink "
                       "name=cv_sink emit-signals=true max-buffers=1 drop=true",
                       in, v_width, v_height, fps);
   app_sink_pipeline = gst_parse_launch(pipeline_str, &error);
