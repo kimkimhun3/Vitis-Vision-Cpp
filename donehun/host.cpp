@@ -351,7 +351,7 @@ int main(int argc, char *argv[]) {
       "queue ! omxh264enc target-bitrate=%u num-slices=1 "
       "control-rate=low-latency qp-mode=auto prefetch-buffer=true "
       "cpb-size=200 initial-delay=200 "
-      "gdr-mode=disabled periodicity-idr=30 gop-length=30 filler-data=true ! "
+      "gdr-mode=atuo periodicity-idr=30 gop-length=30 filler-data=true ! "
       "video/x-h264, alignment=au, profile=main, stream-format=byte-stream ! "
       "rtph264pay mtu=1400 ! "
       "queue max-size-buffers=2  ! "

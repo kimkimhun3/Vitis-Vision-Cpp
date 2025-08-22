@@ -354,6 +354,13 @@ int main(int argc, char *argv[]) {
     gst_object_unref(app_src_pipeline);
     return 0;
 }
+<<<<<<< HEAD
 
 
 Take a look at this program, analyze and then understand it
+=======
+// Let's me share you something based on the result that I run at the moment.
+// I only run with h264.
+// With 30fps, it works fine with resolutions: 3840x2160, 2560x1440, 1920x1080, 1280x720
+// With 60fps, it works fine with resolutions: 3840x2160, 2560x1440, 1280x720 except 1920x1080, it can perform half of input bitrate. look like not full data when in 2nd pipeline.
+>>>>>>> 4421c76bf98111f25156c1ee7ff9b44af2fc2d6f
