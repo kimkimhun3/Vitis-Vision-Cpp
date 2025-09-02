@@ -69,8 +69,8 @@ static gboolean set_resolution_from_input(const char* input_res) {
         g_print("Selected 4K resolution: %dx%d\n", v_width, v_height);
         return TRUE;
     } else if (g_strcmp0(input_res, "2K") == 0) {
-        v_width = 1920;
-        v_height = 1080;
+        v_width = 1280;
+        v_height = 720;
         g_print("Selected 2K resolution: %dx%d\n", v_width, v_height);
         return TRUE;
     } else {
